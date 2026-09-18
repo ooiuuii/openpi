@@ -281,7 +281,7 @@ test("real Pi waits for a foreground formatter before the next prompt reaches it
   }
 });
 
-for (const name of ["write", "edit", "bash"] as const) {
+for (const name of ["write", "edit", "bash", "read"] as const) {
   test(`real Pi native ${name} backstop joins formatter with agent_start fence omitted`, {
     timeout: 15_000,
   }, async () => {
@@ -301,19 +301,21 @@ for (const name of ["write", "edit", "bash"] as const) {
                   id: "next-fixture",
                   name,
                   arguments:
-                    name === "edit"
-                      ? {
-                          path: "target.txt",
-                          edits: [{ oldText: "formatted", newText: "next" }],
-                        }
-                      : { command: "printf 'next\\n' > target.txt" },
+                    name === "read"
+                      ? { path: "target.txt" }
+                      : name === "edit"
+                        ? {
+                            path: "target.txt",
+                            edits: [{ oldText: "formatted", newText: "next" }],
+                          }
+                        : { command: "printf 'next\\n' > target.txt" },
                 },
           );
           // The harness explicitly omits only post-edit's agent_start handler.
           // Direct agent.prompt bypasses preflight, retaining native tool dispatch.
           const reachedTool = h.observeNextTool();
           const admissions = h.toolAdmissions();
-          const next = h.session.agent.prompt("mutate fixture");
+          const next = h.session.agent.prompt("access fixture");
           try {
             await reachedTool;
             await new Promise<void>((resolve) => setImmediate(resolve));
@@ -332,8 +334,20 @@ for (const name of ["write", "edit", "bash"] as const) {
           }
           assert.equal(
             await readFile(path.join(h.cwd, "target.txt"), "utf8"),
-            "next\n",
+            name === "read" ? "formatted\n" : "next\n",
           );
+          if (name === "read") {
+            const result = h.session.messages.find(
+              (message) =>
+                message.role === "toolResult" &&
+                message.toolCallId === "next-fixture",
+            );
+            assert.ok(result?.role === "toolResult");
+            assert.equal(result.isError, false);
+            assert.deepEqual(result.content, [
+              { type: "text", text: "formatted\n" },
+            ]);
+          }
         },
         true,
       );

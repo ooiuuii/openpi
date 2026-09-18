@@ -210,22 +210,44 @@ test("post-edit joins the active and queued runs before starting the next agent"
   assert.equal(started, true);
 });
 
-test("post-edit fences native mutations but not read-only tool calls", async () => {
-  for (const toolName of ["write", "edit", "bash"]) {
+test("post-edit fences every tool when a formatter is scheduled after agent start", async () => {
+  for (const toolName of [
+    "write",
+    "edit",
+    "bash",
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "custom_reader",
+  ]) {
     const h = harness();
+    await h.emit("agent_start");
     await h.emit("tool_result", { toolName: "write", isError: false });
     await h.emit("agent_settled");
-    await h.emit("tool_call", { toolName: "read" });
     let continued = false;
     const call = h.emit("tool_call", { toolName }).then(() => {
       continued = true;
     });
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(continued, false, toolName);
-    h.executions[0]?.result.resolve(success);
-    await call;
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(continued, false, toolName);
+    } finally {
+      h.executions[0]?.result.resolve(success);
+      await call;
+    }
     assert.equal(continued, true);
   }
+});
+
+test("post-edit admits tools without an outstanding command and reads do not schedule one", async () => {
+  const h = harness();
+  for (const toolName of ["read", "grep", "find", "ls", "custom_reader"]) {
+    assert.equal(await h.emit("tool_call", { toolName }), undefined);
+    await h.emit("tool_result", { toolName, isError: false });
+  }
+  await h.emit("agent_settled");
+  assert.equal(h.executions.length, 0);
 });
 
 test("post-edit snapshots queued command and cwd rather than reinterpreting config", async () => {
@@ -311,11 +333,16 @@ test("only successful native writes schedule one command per settled turn", asyn
 });
 
 test("canceling a waiting Agent unblocks teardown without releasing its command", async () => {
-  for (const event of ["agent_start", "tool_call"]) {
+  for (const [event, toolName] of [
+    ["agent_start", ""],
+    ["tool_call", "write"],
+    ["tool_call", "read"],
+    ["tool_call", "custom_reader"],
+  ] as const) {
     const h = harness();
     await h.emit("tool_result", { toolName: "write", isError: false });
     await h.emit("agent_settled");
-    const wait = h.emit(event, { toolName: "write" });
+    const wait = h.emit(event, { toolName });
     h.controller.abort();
     const result = await wait;
     if (event === "tool_call")

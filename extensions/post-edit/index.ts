@@ -6,8 +6,8 @@
  * tool_result handler only flips a flag — it never awaits or executes, so it
  * cannot slow or wedge the tool pipeline. Execution happens once per turn on
  * agent_settled, which debounces an edit burst into a single run, and is
- * asynchronous. The next agent start and native mutations join outstanding
- * runs so a foreground formatter cannot race the next turn's writes. This is
+ * asynchronous. The next agent start and tool calls join outstanding runs so
+ * a foreground formatter cannot race the next turn's reads or writes. This is
  * session-local coordination, not a workspace lock or an acceptance gate.
  */
 
@@ -23,7 +23,6 @@ import { sanitizeTerminalText } from "../shared/terminal-text.ts";
 
 /** Tools whose success means a file on disk changed. */
 const MUTATING_TOOLS = new Set(["write", "edit"]);
-const GUARDED_TOOLS = new Set([...MUTATING_TOOLS, "bash"]);
 const NOTICE_COMMAND_MAX_CHARS = 160;
 const NOTICE_DETAIL_MAX_CHARS = 320;
 
@@ -138,10 +137,11 @@ export default function postEdit(
     if (ctx.mode === "tui") await joinRuns(ctx.signal);
   });
 
-  pi.on("tool_call", async (event, ctx) => {
-    if (ctx.mode !== "tui" || !GUARDED_TOOLS.has(event.toolName)) return;
+  pi.on("tool_call", async (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
     // Backstop for a command scheduled after this Agent's start event.
-    // No tool replacement; Bash is fenced, but does not schedule post-edit.
+    // Custom tools can also read the workspace, so do not filter by tool name.
+    // Fencing a tool does not make its result schedule post-edit.
     const callGeneration = generation;
     const signal = ctx.signal;
     await joinRuns(signal);

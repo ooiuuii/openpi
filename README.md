@@ -458,7 +458,7 @@ macOS/Linux arm64 与 x64 缺少二进制时，OpenPI 会从官方 Release 下�
 
 配置保存在 `~/.pi/agent/my-pi-setup.json`，与包代码分离，升级不会覆盖。
 
-Post-edit 在交互式 TUI 的一轮成功 Write/Edit 后执行一次；下一轮 Agent 启动和本会话的原生 Write/Edit/Bash 调用会等待尚未完成的命令，避免前台格式化与后续编辑交错。请使用会自行结束的前台命令，不要配置 watch/server 或把写操作放到后台；不会自动超时放行。失败或中断会通知用户，但不会自动修复或阻止后续工作，因此它不是验收门禁。这个边界不覆盖其他 Session、Subagent、外部编辑器或脱离前台命令的子进程。详见 [Post-edit lifecycle](SETUP.md#post-edit-lifecycle)。
+Post-edit 在交互式 TUI 的一轮成功 Write/Edit 后执行一次；下一轮 Agent 启动和本会话的所有工具调用（包括只读及自定义工具）会等待尚未完成的命令，避免前台格式化与后续读写交错。等待不等于触发：仍然只有成功的原生 Write/Edit 会安排后处理。请使用会自行结束的前台命令，不要配置 watch/server 或把写操作放到后台；不会自动超时放行。失败或中断会通知用户，但不会自动修复或阻止后续工作，因此它不是验收门禁。这个边界不覆盖其他 Session、Subagent、外部编辑器或脱离前台命令的子进程。详见 [Post-edit lifecycle](SETUP.md#post-edit-lifecycle)。
 
 Footer 布局以 `footerLines` 作为唯一持久化格式。旧版 `footerItems` 会在读取时迁移，但迁移后的配置不保证能被旧版 OpenPI 正确解释，因此不承诺配置文件的降级兼容性。
 
