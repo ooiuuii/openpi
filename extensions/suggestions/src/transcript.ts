@@ -67,6 +67,8 @@ function capped(text: string, maxBytes: number, notice: string) {
 }
 
 export function redactSecrets(text: string) {
+  // Accept a complete quoted value only at the existing token boundary.
+  // Otherwise consume a whole token without crossing into a later field.
   return text
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [REDACTED]")
     .replace(
@@ -74,7 +76,7 @@ export function redactSecrets(text: string) {
       "[REDACTED]",
     )
     .replace(
-      /(["']?(?:api[_-]?key|access[_-]?key|authorization|cookie|credential|password|passwd|private[_-]?key|secret|token)["']?\s*[:=]\s*)(["']?)[^\s,;}]+\2/gi,
+      /(["']?(?:api[_-]?key|access[_-]?key|authorization|cookie|credential|password|passwd|private[_-]?key|secret|token)["']?\s*[:=]\s*)(?:(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')(?=$|[\s,;}])|[^\s,;}]+)/gi,
       "$1[REDACTED]",
     )
     .replace(
