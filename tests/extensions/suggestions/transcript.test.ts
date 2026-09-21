@@ -196,6 +196,13 @@ test("transcript preserves unlabelled quoted prose and unquoted redaction", () =
 });
 
 for (const fixture of [
+  ...[")", "]", ".", ").]"].flatMap((closer) =>
+    ['"', "'"].map((quote) => ({
+      name: `${quote}-quoted value before ${closer}`,
+      text: `password=${quote}north south${quote}${closer} next=visible`,
+      expected: `password=[REDACTED]${closer} next=visible`,
+    })),
+  ),
   {
     name: "adjacent shell-quoted segments",
     text: `password='north'"'"'south' next=visible`,
@@ -204,6 +211,16 @@ for (const fixture of [
   {
     name: "adjacent quoted and unquoted segments",
     text: `token="north"middle'south' next=visible`,
+    expected: "token=[REDACTED] next=visible",
+  },
+  {
+    name: "quoted shell segments joined by punctuation",
+    text: `password="north"."south" next=visible`,
+    expected: "password=[REDACTED] next=visible",
+  },
+  {
+    name: "quoted and unquoted shell segments joined by punctuation",
+    text: `token='north'.south next=visible`,
     expected: "token=[REDACTED] next=visible",
   },
   {
