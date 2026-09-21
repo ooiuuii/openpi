@@ -32,9 +32,7 @@ import {
   type WebTurnCancellationResult,
   WebRuntimeRequestError,
 } from "./types.ts";
-import {
-  projectMessage,
-} from "../protocol/types.ts";
+import { projectMessage, projectAssistantError } from "../protocol/types.ts";
 import { elapsed, traceWeb } from "../trace.ts";
 import {
   applyHttpProxySettings,
@@ -54,6 +52,10 @@ import {
   projectWebTrustStatus,
 } from "./trust-status.ts";
 import { projectWebModelSearch } from "./model-discovery.ts";
+import { matchesSessionIdentity } from "./session-identity.ts";
+import {
+  projectWebSettingsResources,
+} from "./settings-catalog.ts";
 
 const STARTUP_TIMEOUT_MS = 15_000;
 const TURN_CANCELLATION_SETTLEMENT_TIMEOUT_MS = 10_000;
@@ -136,11 +138,12 @@ export class PiWebRuntime implements WebRuntimeController {
   private promptAdmission: Promise<void> = Promise.resolve();
   private thinkingMutationInFlight = false;
   private thinkingMutationPending?: {
-    level: string;
     waiters: Array<{
+      level: string;
       resolve: (projection: WebThinkingProjection) => void;
       reject: (error: unknown) => void;
       expectedSessionId?: string;
+      expectedSessionPath?: string;
     }>;
   };
   private activePromptTrace?: PromptTrace;
@@ -401,6 +404,12 @@ export class PiWebRuntime implements WebRuntimeController {
     return commandsForServices(this.runtime.services);
   }
 
+  listSettingsResources() {
+    this.assertActive();
+    this.assertWorkspaceSelected();
+    return projectWebSettingsResources(this.runtime.services.resourceLoader);
+  }
+
   listProviderAuth(): WebProviderAuthProjection {
     const modelRuntime = this.runtime.services.modelRuntime;
     const allProviders = modelRuntime.getProviders();
@@ -456,6 +465,26 @@ export class PiWebRuntime implements WebRuntimeController {
     };
   }
 
+  getSessionUsage() {
+    const stats = this.runtime.session.getSessionStats();
+    return {
+      input: stats.tokens.input,
+      output: stats.tokens.output,
+      cacheRead: stats.tokens.cacheRead,
+      cacheWrite: stats.tokens.cacheWrite,
+      total: stats.tokens.total,
+      ...(stats.contextUsage
+        ? {
+            context: {
+              tokens: stats.contextUsage.tokens,
+              contextWindow: stats.contextUsage.contextWindow,
+              percent: stats.contextUsage.percent,
+            },
+          }
+        : {}),
+    };
+  }
+
   setModel(
     provider: string,
     modelId: string,
@@ -474,11 +503,7 @@ export class PiWebRuntime implements WebRuntimeController {
     this.assertActive();
     this.assertWorkspaceSelected();
     const agentRuntime = this.runtime;
-    if (
-      options?.expectedSessionId !== undefined &&
-      options.expectedSessionId !==
-        agentRuntime.session.sessionManager.getSessionId()
-    ) {
+    if (!matchesSessionIdentity(agentRuntime.session.sessionManager, options)) {
       throw new WebRuntimeRequestError(
         "Only the active Web session accepts model selection",
         "SESSION_CONFLICT",
@@ -539,25 +564,28 @@ export class PiWebRuntime implements WebRuntimeController {
 
   setThinkingLevel(level: string, options?: WebThinkingSelectionOptions) {
     const expectedSessionId = options?.expectedSessionId;
+    const expectedSessionPath = options?.expectedSessionPath;
     // Validate each caller at enqueue so a stale Session cannot influence, or
     // be silently resolved through, another Session's merged write.
-    if (
-      expectedSessionId !== undefined &&
-      expectedSessionId !== this.runtime.session.sessionManager.getSessionId()
-    ) {
+    if (!matchesSessionIdentity(this.runtime.session.sessionManager, options)) {
       return Promise.reject(this.thinkingSessionConflictError());
     }
     return new Promise<WebThinkingProjection>((resolve, reject) => {
-      const waiter = { resolve, reject, expectedSessionId };
+      const waiter = {
+        level,
+        resolve,
+        reject,
+        expectedSessionId,
+        expectedSessionPath,
+      };
       const pending = this.thinkingMutationPending;
       if (pending) {
-        // Merge-to-latest: a newer target overwrites the queued one and all
-        // waiters resolve from the single authoritative write that follows.
-        pending.level = level;
+        // Coalesce to the latest caller that still owns the active Session
+        // when the serialized write executes.
         pending.waiters.push(waiter);
         return;
       }
-      this.thinkingMutationPending = { level, waiters: [waiter] };
+      this.thinkingMutationPending = { waiters: [waiter] };
       void this.drainThinkingMutations();
     });
   }
@@ -584,17 +612,14 @@ export class PiWebRuntime implements WebRuntimeController {
           const outcome = await this.serializeControllerMutation(async () => {
             this.assertActive();
             this.assertWorkspaceSelected();
-            const activeSessionId =
-              this.runtime.session.sessionManager.getSessionId();
-            const accepted = pending.waiters.filter(
-              (waiter) =>
-                waiter.expectedSessionId === undefined ||
-                waiter.expectedSessionId === activeSessionId,
+            const accepted = pending.waiters.filter((waiter) =>
+              matchesSessionIdentity(this.runtime.session.sessionManager, waiter),
             );
-            if (accepted.length === 0) return undefined;
+            const latest = accepted.at(-1);
+            if (!latest) return undefined;
             return {
               accepted,
-              projection: await this.applyThinkingSelection(pending.level),
+              projection: await this.applyThinkingSelection(latest.level),
             };
           });
           if (!outcome) {
@@ -611,7 +636,7 @@ export class PiWebRuntime implements WebRuntimeController {
           }
         } catch (error) {
           traceWeb("thinking_selection_failed", {
-            level: pending.level,
+            level: pending.waiters.at(-1)?.level,
             error: errorText(error),
           });
           for (const waiter of pending.waiters) waiter.reject(error);
@@ -648,10 +673,7 @@ export class PiWebRuntime implements WebRuntimeController {
     const agentRuntime = this.runtime;
     const session = agentRuntime.session;
     const sessionId = session.sessionManager.getSessionId();
-    if (
-      options?.expectedSessionId !== undefined &&
-      options.expectedSessionId !== sessionId
-    ) {
+    if (!matchesSessionIdentity(session.sessionManager, options)) {
       throw new WebRuntimeRequestError(
         "Only the active Web session accepts messages",
         "SESSION_CONFLICT",
@@ -692,6 +714,21 @@ export class PiWebRuntime implements WebRuntimeController {
       try {
         await previousAdmission;
         this.assertActive();
+        this.assertWorkspaceSelected();
+        if (
+          agentRuntime !== this.runtime ||
+          session !== this.runtime.session ||
+          !matchesSessionIdentity(session.sessionManager, {
+            expectedSessionId: sessionId,
+            expectedSessionPath: options?.expectedSessionPath,
+          })
+        ) {
+          throw new WebRuntimeRequestError(
+            "Only the active Web session accepts messages",
+            "SESSION_CONFLICT",
+            409,
+          );
+        }
         if (promptTrace && agentRuntime === this.runtime) {
           this.pendingPromptTraces.push(promptTrace);
           this.activePromptTrace ??= this.pendingPromptTraces.shift();
@@ -722,6 +759,15 @@ export class PiWebRuntime implements WebRuntimeController {
           }
         });
         await session.prompt(content, {
+          ...(options?.images?.length
+            ? {
+                images: options.images.map(({ data, mimeType }) => ({
+                  type: "image" as const,
+                  data,
+                  mimeType,
+                })),
+              }
+            : {}),
           ...(session.isStreaming
             ? { streamingBehavior: "followUp" as const }
             : {}),
@@ -800,17 +846,19 @@ export class PiWebRuntime implements WebRuntimeController {
         releaseAdmission();
         if (!admitted) {
           rejectRequest(
-            new WebRuntimeRequestError(
-              errorText(error),
-              "PROMPT_REJECTED",
-              422,
-            ),
+            error instanceof WebRuntimeRequestError
+              ? error
+              : new WebRuntimeRequestError(
+                  errorText(error),
+                  "PROMPT_REJECTED",
+                  422,
+                ),
           );
         } else if (admitted) {
           this.emit("prompt_failed", {
             ...(options?.commandId ? { commandId: options.commandId } : {}),
             sessionId,
-            error: errorText(error),
+            error: projectAssistantError(errorText(error)).value,
           });
         }
         if (promptTrace) {
@@ -819,7 +867,7 @@ export class PiWebRuntime implements WebRuntimeController {
             commandId: promptTrace.commandId,
             sessionId,
             elapsedMs: elapsed(startedAt),
-            error: errorText(error),
+            error: projectAssistantError(errorText(error)).value,
           });
           this.removePromptTrace(promptTrace);
         }
@@ -1161,19 +1209,19 @@ export class PiWebRuntime implements WebRuntimeController {
           eventDetail.stopReason = message.stopReason;
         }
         if (typeof message.errorMessage === "string") {
-          eventDetail.errorMessage = message.errorMessage;
+          eventDetail.errorMessage = projectAssistantError(message.errorMessage).value;
         }
       }
       if (event.type === "auto_retry_start") {
         eventDetail.attempt = event.attempt;
         eventDetail.maxAttempts = event.maxAttempts;
         eventDetail.delayMs = event.delayMs;
-        eventDetail.errorMessage = event.errorMessage;
+        eventDetail.errorMessage = projectAssistantError(event.errorMessage).value;
       }
       if (event.type === "auto_retry_end") {
         eventDetail.attempt = event.attempt;
         eventDetail.success = event.success;
-        if (event.finalError) eventDetail.finalError = event.finalError;
+        if (event.finalError) eventDetail.finalError = projectAssistantError(event.finalError).value;
       }
       if (event.type === "agent_end") eventDetail.willRetry = event.willRetry;
       traceWeb("agent_event", eventDetail);

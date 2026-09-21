@@ -7,14 +7,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { registerWebCapability } from "../../extensions/shared/web-observer-registry.ts";
-import { WebHost } from "../../web/host/web-host.ts";
+import { loadSetupConfig } from "../../extensions/shared/setup-config.ts";
+import {
+  registerWebCapability,
+  registerWebCapabilityActions,
+} from "../../extensions/shared/web-observer-registry.ts";
+import type { EmbeddedBrowserService } from "../../web/host/embedded-browser.ts";
+import type { GitReviewService } from "../../web/host/git-review.ts";
+import type { InteractiveTerminalService } from "../../web/host/interactive-terminal.ts";
+import { WebHost, type WebHostOptions } from "../../web/host/web-host.ts";
+import type { WebInteractiveTerminalEvent } from "../../web/protocol/types.ts";
 import { projectWebModelSearch } from "../../web/runtime/model-discovery.ts";
 import {
   type WebRuntimeController,
   type WebRuntimeEvent,
   WebRuntimeRequestError,
 } from "../../web/runtime/types.ts";
+
+function mutationSessionPath(manager: WebRuntimeController["sessionManager"]) {
+  return manager.getSessionFile() ?? `current:${manager.getSessionId()}`;
+}
 
 // Use a raw document request: fetch always sets Sec-Fetch-Mode to cors.
 function documentRequest(url: string, headers: Record<string, string> = {}) {
@@ -98,6 +110,33 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
           }
         : undefined,
   });
+  const capabilityActions: string[] = [];
+  const unregisterCapabilityActions = registerWebCapabilityActions(
+    sessionManager,
+    {
+      kind: "subagents",
+      async run(request) {
+        capabilityActions.push(request.action);
+        return {
+          kind: "subagents",
+          id: "btw-web",
+          title: "Side question",
+          origin: "btw",
+          status: "running",
+          createdAt: 1,
+          cwd,
+          model: "fixture/current-model",
+          prompt:
+            request.action === "spawn-btw" ? request.prompt : "Side question",
+          transcript: [],
+          liveTools: [],
+          finalText: "",
+          truncated: false,
+          omittedEntries: 0,
+        };
+      },
+    },
+  );
   const prompts: string[] = [];
   const creationCommandIds: string[] = [];
   let newSessions = 0;
@@ -213,6 +252,10 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
     assert.match(
       page.headers.get("content-security-policy") || "",
       /img-src 'self' data:/u,
+    );
+    assert.match(
+      page.headers.get("content-security-policy") || "",
+      /frame-src 'none'/u,
     );
     assert.equal(page.headers.get("referrer-policy"), "no-referrer");
     const pageHtml = await page.text();
@@ -420,7 +463,7 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
       runtime: { status: string; capabilities: Record<string, unknown> };
     };
     assert.equal(snapshot.protocolVersion, 1);
-    assert.equal(snapshot.preferences.theme, "system");
+    assert.equal(snapshot.preferences.theme, loadSetupConfig().ui.webTheme);
     assert.ok(snapshot.cursor >= 1);
     assert.equal(snapshot.currentSessionId, sessionManager.getSessionId());
     assert.ok(Array.isArray(snapshot.models));
@@ -582,6 +625,88 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
       code: "CAPABILITY_NOT_FOUND",
       error: "capability resource was not found in the active Session",
     });
+    assert.equal(
+      (
+        await fetch(`${launched.origin}/api/capabilities/action`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId: sessionManager.getSessionId(),
+            kind: "subagents",
+            action: "spawn-btw",
+            prompt: "inspect this",
+          }),
+        })
+      ).status,
+      401,
+    );
+    const invalidCapabilityAction = await fetch(
+      `${launched.origin}/api/capabilities/action`,
+      {
+        method: "POST",
+        headers: authorized,
+        body: JSON.stringify({
+          sessionId: sessionManager.getSessionId(),
+          kind: "subagents",
+          action: "spawn-btw",
+          prompt: " ",
+        }),
+      },
+    );
+    assert.equal(invalidCapabilityAction.status, 400);
+    assert.equal(
+      (await invalidCapabilityAction.json()).code,
+      "INVALID_CAPABILITY_ACTION",
+    );
+    const staleCapabilityAction = await fetch(
+      `${launched.origin}/api/capabilities/action`,
+      {
+        method: "POST",
+        headers: authorized,
+        body: JSON.stringify({
+          sessionId: "another-session",
+          kind: "subagents",
+          action: "spawn-btw",
+          prompt: "inspect this",
+        }),
+      },
+    );
+    assert.equal(staleCapabilityAction.status, 409);
+    assert.equal((await staleCapabilityAction.json()).code, "SESSION_CHANGED");
+    const capabilityAction = await fetch(
+      `${launched.origin}/api/capabilities/action`,
+      {
+        method: "POST",
+        headers: authorized,
+        body: JSON.stringify({
+          sessionId: sessionManager.getSessionId(),
+          kind: "subagents",
+          action: "spawn-btw",
+          prompt: "inspect this",
+        }),
+      },
+    );
+    assert.equal(capabilityAction.status, 200);
+    assert.deepEqual(await capabilityAction.json(), {
+      sessionId: sessionManager.getSessionId(),
+      detail: {
+        kind: "subagents",
+        id: "btw-web",
+        title: "Side question",
+        origin: "btw",
+        status: "running",
+        createdAt: 1,
+        cwd,
+        model: "fixture/current-model",
+        prompt: "inspect this",
+        transcript: [],
+        liveTools: [],
+        finalText: "",
+        truncated: false,
+        omittedEntries: 0,
+      },
+    });
+    assert.deepEqual(capabilityActions, ["spawn-btw"]);
     const unavailableModel = await fetch(`${launched.origin}/api/model`, {
       method: "POST",
       headers: authorized,
@@ -589,6 +714,7 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
         provider: "missing",
         modelId: "missing",
         sessionId: sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(sessionManager),
       }),
     });
     assert.equal(unavailableModel.status, 400);
@@ -770,7 +896,11 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
     const wrongSession = await fetch(`${launched.origin}/api/prompt`, {
       method: "POST",
       headers: authorized,
-      body: JSON.stringify({ sessionId: "other", content: "wrong target" }),
+      body: JSON.stringify({
+        sessionId: "other",
+        sessionPath: mutationSessionPath(sessionManager),
+        content: "wrong target",
+      }),
     });
     assert.equal(wrongSession.status, 409);
 
@@ -779,6 +909,7 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
       headers: authorized,
       body: JSON.stringify({
         sessionId: sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(sessionManager),
         content: "continue here",
       }),
     });
@@ -983,6 +1114,7 @@ test("serves workspaces through a runtime isolated from terminal sessions", asyn
     await host.stop();
     assert.equal(disposed, true);
     unregisterTerminalDetails();
+    unregisterCapabilityActions();
     unregister();
     await Promise.all(
       [cwd, imported].map((path) => rm(path, { recursive: true, force: true })),
@@ -1220,6 +1352,7 @@ test("an unbound Host exposes no bootstrap Session and rejects prompt bypasses",
       headers,
       body: JSON.stringify({
         sessionId: sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(sessionManager),
         content: "must not run",
       }),
     });
@@ -1303,6 +1436,7 @@ test("returns accepted only after Pi admits the prompt", async () => {
       },
       body: JSON.stringify({
         sessionId: sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(sessionManager),
         content: "hello",
       }),
     });
@@ -1418,7 +1552,7 @@ test("thinking selection validates its body and returns the applied projection",
     });
     assert.equal(missingSession.status, 400);
     assert.deepEqual(await missingSession.json(), {
-      error: "sessionId and a valid level are required",
+      error: "sessionId, sessionPath, and a valid level are required",
     });
 
     const invalidLevel = await fetch(`${launched.origin}/api/thinking`, {
@@ -1426,6 +1560,7 @@ test("thinking selection validates its body and returns the applied projection",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         level: "ultra",
       }),
     });
@@ -1438,6 +1573,7 @@ test("thinking selection validates its body and returns the applied projection",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         level: "high",
       }),
     });
@@ -1478,6 +1614,7 @@ test("thinking selection requires a workspace and available runtime control", as
           headers: { ...unboundHost.headers, ...headers },
           body: JSON.stringify({
             sessionId: unbound.sessionManager.getSessionId(),
+            sessionPath: mutationSessionPath(unbound.sessionManager),
             level: "high",
           }),
         },
@@ -1498,6 +1635,7 @@ test("thinking selection requires a workspace and available runtime control", as
           headers: { ...unavailableHost.headers, ...headers },
           body: JSON.stringify({
             sessionId: unavailable.sessionManager.getSessionId(),
+            sessionPath: mutationSessionPath(unavailable.sessionManager),
             level: "high",
           }),
         },
@@ -1654,6 +1792,7 @@ test("POST /api/thinking bounds an oversized projection at the host boundary", a
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         level: "high",
       }),
     });
@@ -1690,6 +1829,7 @@ test("POST /api/thinking reports unavailable levels for a non-reasoning model", 
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         level: "high",
       }),
     });
@@ -1731,6 +1871,7 @@ test("stop waits for an in-flight thinking selection before disposal", async () 
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         level: "high",
       }),
     });
@@ -1781,8 +1922,11 @@ function testRuntime(
   return runtime;
 }
 
-async function startTestHost(runtime: WebRuntimeController) {
-  const host = new WebHost({ runtime });
+async function startTestHost(
+  runtime: WebRuntimeController,
+  options: Omit<WebHostOptions, "runtime"> = {},
+) {
+  const host = new WebHost({ runtime, ...options });
   await host.start();
   const launched = new URL(host.url);
   const token = new URLSearchParams(launched.hash.slice(1)).get("token");
@@ -1790,6 +1934,268 @@ async function startTestHost(runtime: WebRuntimeController) {
   const headers = { Authorization: `Bearer ${token}` };
   return { host, launched, headers };
 }
+
+test("exposes an embedded browser and an active-Session interactive terminal", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openpi-web-tools-"));
+  const runtime = testRuntime(cwd);
+  const sessionId = runtime.sessionManager.getSessionId();
+  const opened: string[] = [];
+  const browserActions: unknown[] = [];
+  const writes: string[] = [];
+  const sizes: Array<[number, number]> = [];
+  let disposed = false;
+  let browserDisposed = false;
+  let subscribedAfter: number | undefined;
+  let terminalListener:
+    | ((event: WebInteractiveTerminalEvent) => void)
+    | undefined;
+  const terminal = {
+    id: "terminal-1",
+    sessionId,
+    cwd,
+    exited: false,
+    exitCode: null,
+  };
+  const interactiveTerminals: InteractiveTerminalService = {
+    async create(options) {
+      assert.deepEqual(options, { sessionId, cwd, cols: 80, rows: 24 });
+      return { ...terminal, reused: false };
+    },
+    get(owner, id) {
+      return owner === sessionId && id === terminal.id ? terminal : undefined;
+    },
+    write(owner, id, data) {
+      if (owner !== sessionId || id !== terminal.id) return false;
+      writes.push(data);
+      return true;
+    },
+    resize(owner, id, cols, rows) {
+      if (owner !== sessionId || id !== terminal.id) return false;
+      sizes.push([cols, rows]);
+      return true;
+    },
+    subscribe(owner, id, listener, after) {
+      if (owner !== sessionId || id !== terminal.id) return undefined;
+      subscribedAfter = after;
+      terminalListener = listener;
+      return {
+        output: {
+          type: "output",
+          data: "prompt> ",
+          offset: 8,
+          reset: true,
+        },
+        exited: false,
+        exitCode: null,
+        unsubscribe() {
+          terminalListener = undefined;
+        },
+      };
+    },
+    close(owner, id) {
+      if (owner !== sessionId || id !== terminal.id) return false;
+      terminalListener?.({ type: "closed" });
+      return true;
+    },
+    retain() {},
+    dispose() {
+      disposed = true;
+    },
+  };
+  const embeddedBrowser: EmbeddedBrowserService = {
+    async open(owner, url, viewport) {
+      assert.equal(owner, sessionId);
+      opened.push(url);
+      return {
+        sessionId,
+        url,
+        title: "Example",
+        width: viewport?.width ?? 1_024,
+        height: viewport?.height ?? 768,
+        loading: false,
+        canGoBack: false,
+        canGoForward: false,
+      };
+    },
+    async state(owner) {
+      return owner === sessionId
+        ? {
+            sessionId,
+            url: opened.at(-1) ?? "about:blank",
+            title: "Example",
+            width: 1_024,
+            height: 768,
+            loading: false,
+            canGoBack: false,
+            canGoForward: false,
+          }
+        : undefined;
+    },
+    async frame(owner) {
+      return owner === sessionId
+        ? Buffer.from([0xff, 0xd8, 0xff, 0xd9])
+        : undefined;
+    },
+    async action(owner, action) {
+      if (owner !== sessionId) return undefined;
+      browserActions.push(action);
+      return {
+        sessionId,
+        url: opened.at(-1) ?? "about:blank",
+        title: "Example",
+        width: 1_024,
+        height: 768,
+        loading: false,
+        canGoBack: action.type !== "back",
+        canGoForward: false,
+      };
+    },
+    retain() {},
+    async dispose() {
+      browserDisposed = true;
+    },
+  };
+  const { host, launched, headers } = await startTestHost(runtime, {
+    embeddedBrowser,
+    interactiveTerminals,
+  });
+  const jsonHeaders = { ...headers, "Content-Type": "application/json" };
+  try {
+    assert.equal(
+      (
+        await fetch(`${launched.origin}/api/browser/open`, {
+          method: "POST",
+          headers: jsonHeaders,
+          body: JSON.stringify({ sessionId, url: "file:///tmp/private" }),
+        })
+      ).status,
+      400,
+    );
+    const browser = await fetch(`${launched.origin}/api/browser/open`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ sessionId, url: "https://example.com/path" }),
+    });
+    assert.equal(browser.status, 200);
+    assert.deepEqual(await browser.json(), {
+      sessionId,
+      url: "https://example.com/path",
+      title: "Example",
+      width: 1_024,
+      height: 768,
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+    });
+    assert.deepEqual(opened, ["https://example.com/path"]);
+    const browserState = await fetch(
+      `${launched.origin}/api/browser/state?sessionId=${sessionId}`,
+      { headers },
+    );
+    assert.equal(browserState.status, 200);
+    assert.equal((await browserState.json()).title, "Example");
+    const browserFrame = await fetch(
+      `${launched.origin}/api/browser/frame?sessionId=${sessionId}`,
+      { headers },
+    );
+    assert.equal(browserFrame.status, 200);
+    assert.equal(browserFrame.headers.get("content-type"), "image/jpeg");
+    assert.deepEqual(
+      Buffer.from(await browserFrame.arrayBuffer()),
+      Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    );
+    const browserAction = await fetch(`${launched.origin}/api/browser/action`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ sessionId, action: "reload" }),
+    });
+    assert.equal(browserAction.status, 200);
+    assert.deepEqual(browserActions, [{ type: "reload" }]);
+
+    const created = await fetch(`${launched.origin}/api/terminal`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ sessionId, cols: 80, rows: 24 }),
+    });
+    assert.equal(created.status, 201);
+    assert.equal((await created.json()).id, terminal.id);
+    assert.equal(
+      (
+        await fetch(
+          `${launched.origin}/api/terminal?sessionId=${sessionId}&id=${terminal.id}`,
+          { headers },
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await fetch(`${launched.origin}/api/terminal/input`, {
+          method: "POST",
+          headers: jsonHeaders,
+          body: JSON.stringify({ sessionId, id: terminal.id, data: "pwd\r" }),
+        })
+      ).status,
+      200,
+    );
+    assert.deepEqual(writes, ["pwd\r"]);
+    assert.equal(
+      (
+        await fetch(`${launched.origin}/api/terminal/resize`, {
+          method: "POST",
+          headers: jsonHeaders,
+          body: JSON.stringify({
+            sessionId,
+            id: terminal.id,
+            cols: 100,
+            rows: 30,
+          }),
+        })
+      ).status,
+      200,
+    );
+    assert.deepEqual(sizes, [[100, 30]]);
+
+    const stream = await fetch(
+      `${launched.origin}/api/terminal/events?sessionId=${sessionId}&id=${terminal.id}&after=3`,
+      { headers },
+    );
+    assert.equal(stream.status, 200);
+    assert.match(
+      stream.headers.get("content-type") ?? "",
+      /text\/event-stream/u,
+    );
+    assert.equal(subscribedAfter, 3);
+    const reader = stream.body?.getReader();
+    assert.ok(reader);
+    const decoder = new TextDecoder();
+    let streamed = "";
+    while (!streamed.includes("prompt> ")) {
+      const next: ReadableStreamReadResult<Uint8Array> = await reader.read();
+      assert.equal(next.done, false);
+      streamed += decoder.decode(next.value, { stream: true });
+    }
+    assert.match(streamed, /"reset":true/u);
+    terminalListener?.({ type: "output", data: "ready\r\n", offset: 15 });
+    while (!streamed.includes("ready\\r\\n")) {
+      const next: ReadableStreamReadResult<Uint8Array> = await reader.read();
+      assert.equal(next.done, false);
+      streamed += decoder.decode(next.value, { stream: true });
+    }
+    await reader.cancel();
+
+    const closed = await fetch(
+      `${launched.origin}/api/terminal?sessionId=${sessionId}&id=${terminal.id}`,
+      { method: "DELETE", headers },
+    );
+    assert.equal(closed.status, 200);
+  } finally {
+    await host.stop();
+    assert.equal(disposed, true);
+    assert.equal(browserDisposed, true);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 test("serves Session-bound command discovery with fail-closed request validation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "openpi-web-commands-"));
@@ -1887,6 +2293,104 @@ test("serves Session-bound command discovery with fail-closed request validation
     const body = await response.text();
     assert.match(body, /"name":"review"/u);
     assert.doesNotMatch(body, /sourceInfo|\/private\/|private-fixture/u);
+  } finally {
+    await host.stop();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("serves a read-only Session-bound settings catalog without a preference write endpoint", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openpi-web-settings-"));
+  const runtime = testRuntime(cwd);
+  let workspaceSelected = true;
+  Object.defineProperty(runtime, "workspaceSelected", {
+    configurable: true,
+    get: () => workspaceSelected,
+  });
+  runtime.listSettingsResources = () => ({
+    skills: [],
+    plugins: [],
+    totals: { extensions: 2, skills: 0, prompts: 0, themes: 1 },
+    diagnostics: { extensionErrors: 0, skillErrors: 0 },
+    truncation: {
+      truncated: false,
+      skillsOmitted: 0,
+      pluginsOmitted: 0,
+      resourcesOmitted: 0,
+    },
+  });
+  const { host, launched, headers } = await startTestHost(runtime);
+  const sessionId = runtime.sessionManager.getSessionId();
+  try {
+    const invalid = await fetch(`${launched.origin}/api/settings/catalog`, {
+      headers,
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(
+      (await invalid.json()).code,
+      "INVALID_SETTINGS_CATALOG_REQUEST",
+    );
+
+    const stale = await fetch(
+      `${launched.origin}/api/settings/catalog?sessionId=stale-session`,
+      { headers },
+    );
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json()).code, "SESSION_CHANGED");
+
+    workspaceSelected = false;
+    const noWorkspace = await fetch(
+      `${launched.origin}/api/settings/catalog?sessionId=${sessionId}`,
+      { headers },
+    );
+    assert.equal(noWorkspace.status, 409);
+    assert.equal((await noWorkspace.json()).code, "WORKSPACE_REQUIRED");
+
+    workspaceSelected = true;
+    const response = await fetch(
+      `${launched.origin}/api/settings/catalog?sessionId=${sessionId}`,
+      { headers },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      sessionId: string;
+      setup: {
+        ui: {
+          webTheme: string;
+          webChatWidth: number;
+          webChatFontSize: number;
+          webExpandThinking: boolean;
+        };
+      };
+      resources: { totals: { extensions: number } };
+    };
+    assert.equal(body.sessionId, sessionId);
+    assert.equal(typeof body.setup.ui.webTheme, "string");
+    assert.equal(typeof body.setup.ui.webChatWidth, "number");
+    assert.equal(typeof body.setup.ui.webChatFontSize, "number");
+    assert.equal(typeof body.setup.ui.webExpandThinking, "boolean");
+    assert.equal(body.resources.totals.extensions, 2);
+
+    const writeAttempt = await fetch(
+      `${launched.origin}/api/settings/preferences`,
+      {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          preferences: {
+            theme: "dark",
+            chatWidth: 960,
+            chatFontSize: 16,
+            expandThinking: true,
+          },
+        }),
+      },
+    );
+    assert.equal(writeAttempt.status, 405);
+    assert.deepEqual(await writeAttempt.json(), {
+      error: "method not allowed",
+    });
   } finally {
     await host.stop();
     await rm(cwd, { recursive: true, force: true });
@@ -2158,6 +2662,7 @@ test("rejects prompt admission with the runtime's typed receipt", async () => {
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         content: "reject me",
         commandId: "rejected-admission",
         retry: false,
@@ -2173,6 +2678,7 @@ test("rejects prompt admission with the runtime's typed receipt", async () => {
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         content: "reject me",
         commandId: "rejected-admission",
         retry: true,
@@ -2209,6 +2715,7 @@ test("replays one prompt admission after a browser timeout", async () => {
   const commandId = "browser-timeout-retry";
   const prompt = {
     sessionId: runtime.sessionManager.getSessionId(),
+    sessionPath: mutationSessionPath(runtime.sessionManager),
     content: "send this exactly once",
     commandId,
   };
@@ -2315,6 +2822,7 @@ test("fails closed instead of evicting pending prompt admissions", {
         headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({
           sessionId: runtime.sessionManager.getSessionId(),
+          sessionPath: mutationSessionPath(runtime.sessionManager),
           content: `pending ${index}`,
           commandId: `pending-${index}`,
           retry: false,
@@ -2329,6 +2837,7 @@ test("fails closed instead of evicting pending prompt admissions", {
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         content: "must not replace a pending admission",
         commandId: "overflow",
         retry: false,
@@ -2369,6 +2878,7 @@ test("returns and publishes the observed follow-up queue receipt", async () => {
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         content: "queue me",
       }),
     });
@@ -2624,6 +3134,40 @@ test("concurrent stop callers await the same runtime disposal", async () => {
   }
 });
 
+test("stop waits for Git review baseline lifecycle cleanup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "openpi-web-git-cleanup-"));
+  let releaseCleanup!: () => void;
+  const cleanupBarrier = new Promise<void>((resolve) => {
+    releaseCleanup = resolve;
+  });
+  let disposeCalls = 0;
+  const gitReviews: GitReviewService = {
+    capture: async () => undefined,
+    read: async () => ({ ok: false, reason: "git_failed" }),
+    dispose: async () => {
+      disposeCalls++;
+      await cleanupBarrier;
+    },
+  };
+  const { host } = await startTestHost(testRuntime(cwd), { gitReviews });
+  try {
+    const stopping = host.stop();
+    let settled = false;
+    void stopping.then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(disposeCalls, 1);
+    assert.equal(settled, false);
+    releaseCleanup();
+    await stopping;
+  } finally {
+    releaseCleanup();
+    await host.stop();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("stop waits for lease-sensitive HTTP mutations before runtime disposal", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "openpi-web-stop-mutation-"));
   const runtime = testRuntime(cwd);
@@ -2785,6 +3329,7 @@ test("stop rejects a late keepalive mutation before it enters the drain", async 
     await once(socket, "connect");
     const promptBody = JSON.stringify({
       sessionId: runtime.sessionManager.getSessionId(),
+      sessionPath: mutationSessionPath(runtime.sessionManager),
       content: "hold the first request",
     });
     socket.write(
@@ -2947,6 +3492,7 @@ test("stop disposes the runtime before waiting for an in-flight prompt request",
       headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({
         sessionId: runtime.sessionManager.getSessionId(),
+        sessionPath: mutationSessionPath(runtime.sessionManager),
         content: "pending during shutdown",
       }),
     });
