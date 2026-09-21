@@ -85,7 +85,7 @@ pi install npm:@tt-a1i/openpi
 <summary>能力如何按需开启，以及原生 Skill 的使用方式</summary>
 
 > [!TIP]
-> Capability discovery 默认 `explicit`：明确说出能力意图才会加载对应组。英文 `subagent` 与 `workflow` 是保留授权词，单独输入也会加载对应能力。
+> Capability discovery 默认 `explicit`：明确说出能力意图才会加载对应组。整条输入只有英文 `subagent` / `subagents` 或 `workflow` / `workflows` 时，视为主动选择对应能力（忽略大小写与首尾空白），名称会高亮，提交后加载工具组。加载不等于立即启动任务，模型仍根据任务上下文决定是否调用。普通句子中仅提及名称不会因此加载；也可以明确要求「用 subagent 帮我查」。
 > 例如 `subagent, workflow` → 同时加载两组；「在后台运行 dev server」→ 后台终端；「用/使用子代理检查」或句首「子代理了解下项目」→ Subagent；「用工作流编排」→ Workflow；「用 fd/rg 搜索」或「用 git diff 比较分支」→ 搜索与只读 Git 工具。
 > 关键是把意图说清楚（说「用子代理」「子代理检查项目」「后台运行」这类带执行动作的短语），不需要记住任何工具名。仅讨论能力的「子代理是什么」不会加载；否定或条件表达也继续 fail closed。
 > `/plan` 是一个运行时安全例外：进入或恢复 Plan Mode 时会为当前 Session 自动加载 `search` 组，让只读调研直接使用结构化 Git 工具。
@@ -442,7 +442,7 @@ macOS/Linux arm64 与 x64 缺少二进制时，OpenPI 会从官方 Release 下�
 
 无参数时，OpenPI 展示当前状态并引导修改；带自然语言时只改指定项：
 
-<!-- config-contract: capabilities.discovery suggestions.enabled suggestions.model workflows.concurrency workflows.maxAgentCalls ui.webTheme ui.showHeader ui.customFooter ui.footerStyle ui.footerLines ui.subagentResultDisplay ui.bashToolDisplay ui.fileMutationDisplay postEdit.command subagents.roleModels -->
+<!-- config-contract: capabilities.discovery suggestions.enabled suggestions.model workflows.concurrency workflows.maxAgentCalls ui.webTheme ui.webChatWidth ui.webChatFontSize ui.webExpandThinking ui.showHeader ui.customFooter ui.footerStyle ui.footerLines ui.subagentResultDisplay ui.bashToolDisplay ui.fileMutationDisplay postEdit.command subagents.roleModels -->
 
 ```text
 /openpi-setup 开启下一步预测，选择 Registry 里的轻量模型，minimal 推理
@@ -450,6 +450,8 @@ macOS/Linux arm64 与 x64 缺少二进制时，OpenPI 会从官方 Release 下�
 /openpi-setup workflow 同时跑 16 个 agent，总调用最多 256
 /openpi-setup Web 主题跟随系统
 /openpi-setup Web 使用深色主题
+/openpi-setup Web 使用雾青主题，聊天宽度设为 960px
+/openpi-setup 聊天字号设为 16px，默认展开思考块
 /openpi-setup Footer 两行：cwd flex model / context cost flex git
 /openpi-setup Bash 展开，Write/Edit 保持紧凑
 /openpi-setup 编辑后自动跑 npm run format
@@ -472,7 +474,9 @@ Footer 布局以 `footerLines` 作为唯一持久化格式。旧版 `footerItems
 | Capability discovery         | `explicit`；`adaptive` 必须显式开启            |
 | Next-action Suggestion       | 关闭；启用时显式选择 Registry 模型与 reasoning |
 | Workflow 并发 / 总调用       | 8 / 128；硬上限 64 / 1024                      |
-| Web 主题                    | `system`；可选 `light` / `dark`                 |
+| Web 主题                    | `system`；另有 `light` / `dark` / `mist` / `rose` / `pine` |
+| Web 聊天宽度 / 聊天字号     | 820px / 14px；范围 820-2000px / 12-24px        |
+| Web 思考块                  | 默认折叠                                       |
 | 大型 Header                  | 关闭                                           |
 | Dashboard Footer             | 开启；单行 `plain`                           |
 | Subagent / Bash / Write/Edit | `compact` / `compact` / `compact`             |
