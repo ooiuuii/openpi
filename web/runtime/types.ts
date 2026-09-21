@@ -3,6 +3,9 @@ import type {
   WebModelSearchResult,
   WebCommandDiscoveryResult,
   WebModelSummary,
+  WebSettingsResourceCatalog,
+  WebSessionUsage,
+  WebPromptImage,
 } from "../protocol/types.ts";
 import type { WebProjectTrustStatus } from "./trust-status.ts";
 
@@ -65,6 +68,8 @@ export class WebRuntimeRequestError extends Error {
 export interface WebPromptOptions {
   commandId?: string;
   expectedSessionId?: string;
+  expectedSessionPath?: string;
+  images?: readonly WebPromptImage[];
 }
 
 export interface WebPromptAdmissionReceipt {
@@ -93,10 +98,12 @@ export interface WebTurnCancellationResult extends WebActiveTurn {
 
 export interface WebModelSelectionOptions {
   expectedSessionId?: string;
+  expectedSessionPath?: string;
 }
 
 export interface WebThinkingSelectionOptions {
   expectedSessionId?: string;
+  expectedSessionPath?: string;
 }
 
 export interface WebThinkingProjection {
@@ -141,7 +148,9 @@ export interface WebRuntimeController {
   listModels(): WebModelSummary[];
   searchModels(query: string, limit?: number): WebModelSearchResult;
   listCommands?(): WebCommandDiscoveryResult;
+  listSettingsResources?(): WebSettingsResourceCatalog;
   listProviderAuth?(): WebProviderAuthProjection;
+  getSessionUsage?(): WebSessionUsage;
   getThinkingState?(): WebThinkingProjection;
   setThinkingLevel?(
     level: string,
