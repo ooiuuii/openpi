@@ -2809,6 +2809,149 @@ describe("thinking level selection", () => {
     store.getState().actions.stop();
   });
 
+  for (const resetCursor of [false, true]) {
+    for (const outcome of ["success", "rejection"] as const) {
+      it(`canonical same-ID copy recovery clears old thinking and protects a newer POST from late ${outcome} (resetCursor=${resetCursor})`, async () => {
+        const { client, store } = await harness({ revision: 40 });
+        const superseded = deferred<WebThinkingState & { sessionId: string }>();
+        client.setThinkingResults.push(superseded.promise);
+        const mutations = vi.spyOn(client, "setThinkingLevel");
+        try {
+          store.getState().actions.selectThinking("high");
+          expect(store.getState().thinkingPendingLevel).toBe("high");
+
+          const copiedPath = "/tmp/ws/copied.jsonl";
+          const copied: WebSnapshot = withThinking(
+            activeSnapshot("session-1", copiedPath, { cursor: 41 }),
+            { level: "medium", revision: 2 },
+          );
+          copied.sessions.push({
+            ...snapshot().sessions[0],
+            controller: "none",
+          });
+          // The requested old file still exists, but the host now controls its
+          // same-ID copy. Recover through the store's real canonical retry.
+          client.snapshots.push(
+            Promise.resolve({
+              ...copied,
+              selectedSession: snapshot().selectedSession,
+            }),
+            Promise.resolve(copied),
+          );
+          expect(
+            await store.getState().actions.refreshSnapshot({ resetCursor }),
+          ).toBe(true);
+          expect(client.snapshotPaths.slice(-2)).toEqual([
+            "/tmp/ws/session.jsonl",
+            null,
+          ]);
+          expect(store.getState().selectedPath).toBe(copiedPath);
+          expect(store.getState().thinkingPendingLevel).toBeNull();
+          expect(store.getState().snapshot?.thinking).toMatchObject({
+            level: "medium",
+            revision: 2,
+          });
+
+          const newer = deferred<WebThinkingState & { sessionId: string }>();
+          client.setThinkingResults.push(newer.promise);
+          store.getState().actions.selectThinking("low");
+          expect(mutations).toHaveBeenLastCalledWith(
+            "session-1",
+            "low",
+            copiedPath,
+          );
+          expect(mutations).toHaveBeenCalledTimes(2);
+          expect(store.getState().thinkingPendingLevel).toBe("low");
+
+          if (outcome === "success") {
+            superseded.resolve({
+              ...copied.thinking!,
+              sessionId: "session-1",
+              level: "high",
+              revision: 999,
+            });
+          } else {
+            superseded.reject(
+              new WebApiError("old file is inactive", 409, "SESSION_CONFLICT"),
+            );
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+          expect(store.getState().thinkingPendingLevel).toBe("low");
+          expect(store.getState().snapshot?.thinking).toMatchObject({
+            level: "medium",
+            revision: 2,
+          });
+          expect(store.getState().notice).toBeNull();
+          expect(mutations).toHaveBeenCalledTimes(2);
+
+          newer.resolve({
+            ...copied.thinking!,
+            sessionId: "session-1",
+            level: "low",
+            revision: 3,
+          });
+          await vi.waitFor(() =>
+            expect(store.getState().thinkingPendingLevel).toBeNull(),
+          );
+          expect(store.getState().snapshot?.thinking).toMatchObject({
+            level: "low",
+            revision: 3,
+          });
+          expect(
+            await store.getState().actions.sendPrompt("after recovery"),
+          ).toBe(true);
+          expect(client.prompts).toEqual([
+            { sessionId: "session-1", content: "after recovery" },
+          ]);
+        } finally {
+          store.getState().actions.stop();
+        }
+      });
+    }
+  }
+
+  it("canonical same-ID copy recovery ignores the old file's thinking reconciliation GET", async () => {
+    const { client, store } = await harness({ revision: 40 });
+    const reconciliation = deferred<WebThinkingState & { sessionId: string }>();
+    client.thinkingResult = reconciliation.promise;
+    client.setThinkingResults.push(
+      Promise.reject(new Error("old POST failed")),
+    );
+    try {
+      store.getState().actions.selectThinking("high");
+      await vi.waitFor(() =>
+        expect(client.thinkingRequests).toEqual(["session-1"]),
+      );
+      expect(store.getState().thinkingPendingLevel).toBeNull();
+
+      const copied = withThinking(
+        activeSnapshot("session-1", "/tmp/ws/copied.jsonl", { cursor: 41 }),
+        { level: "medium", revision: 2 },
+      );
+      client.snapshots.push(Promise.resolve(copied), Promise.resolve(copied));
+      expect(await store.getState().actions.refreshSnapshot()).toBe(true);
+      expect(store.getState().selectedPath).toBe("/tmp/ws/copied.jsonl");
+      expect(store.getState().snapshot?.thinking).toMatchObject({
+        level: "medium",
+        revision: 2,
+      });
+
+      reconciliation.resolve({
+        ...copied.thinking!,
+        sessionId: "session-1",
+        level: "high",
+        revision: 999,
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      expect(store.getState().snapshot?.thinking).toMatchObject({
+        level: "medium",
+        revision: 2,
+      });
+    } finally {
+      store.getState().actions.stop();
+    }
+  });
+
   it("resets pending when the operator selects a different model", async () => {
     const { client, store } = await harness();
     const first = deferred<WebThinkingState & { sessionId: string }>();

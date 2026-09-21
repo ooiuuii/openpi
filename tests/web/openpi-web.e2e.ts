@@ -2510,7 +2510,7 @@ test("a delayed creation receipt never retargets the first prompt to another tab
     expect(importedB.status()).toBe(201);
     const { path: canonicalA } = await importedA.json();
     const { path: canonicalB } = await importedB.json();
-    const workspaceNameA = canonicalA.split("/").at(-1);
+    const workspaceNameA = canonicalA.split(/[\\/]/u).at(-1);
 
     await page.route("**/events?**", (route) =>
       route.fulfill({

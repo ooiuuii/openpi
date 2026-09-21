@@ -479,6 +479,7 @@ export function createWebStore(
     const reconcileThinking = async () => {
       const epoch = sessionEpoch;
       const sessionId = get().snapshot?.selectedSession?.id;
+      const sessionPath = get().selectedPath;
       if (!sessionId) return;
       try {
         const result = await client.thinking(
@@ -487,6 +488,7 @@ export function createWebStore(
         );
         if (
           epoch !== sessionEpoch ||
+          sessionPath !== get().selectedPath ||
           sessionId !== get().snapshot?.selectedSession?.id
         )
           return;
@@ -959,6 +961,15 @@ export function createWebStore(
               ? selectedSessionWorkspace
               : (activeWorkspace ?? retainedWorkspace ?? null);
           const shouldReset = options.resetCursor;
+          if (
+            get().snapshot?.selectedSession?.path !==
+            snapshot.selectedSession?.path
+          ) {
+            // Canonical recovery can change files without a switch event,
+            // including copies with the same embedded Session ID.
+            resetThinking();
+            clearThinkingGate();
+          }
           if (shouldReset) {
             // A cursor reset means a fresh stream (e.g. host restart), whose
             // sequence restarts at 0. The old revision gate would reject every
