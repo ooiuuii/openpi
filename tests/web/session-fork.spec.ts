@@ -597,7 +597,10 @@ it("accepts a fork receipt after its native switch event and ignores an older so
           resolveSource = done;
         }),
     )
-    .mockResolvedValue(snapshot("child", "/project/child.jsonl"));
+    .mockResolvedValue({
+      ...snapshot("child", "/project/child.jsonl"),
+      cursor: 2,
+    });
   store.getState().actions.start();
   try {
     const pending = store.getState().actions.forkMessage(anchor);

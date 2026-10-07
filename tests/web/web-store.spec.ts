@@ -1366,6 +1366,8 @@ describe("OpenPI Web store", () => {
         selectedSession: viewed.selectedSession,
       };
       const target = sameView ? viewed : controller;
+      // This confirmation is read after the activation event below.
+      target.cursor = sameView ? 5 : 4;
       client.snapshots.push(Promise.resolve(target));
       const stream = eventStreamHarness();
       const store = createWebStore(client, {
@@ -1506,6 +1508,421 @@ describe("OpenPI Web store", () => {
     expect(client.commandRequests).toHaveLength(0);
     expect(store.getState().commandDiscovery.status).toBe("idle");
   });
+
+  it.each(["before", "after"])(
+    "retains healthy SSE turn when pending idle HTTP resolves %s the event",
+    async (order) => {
+      vi.useFakeTimers();
+      const client = new FakeClient();
+      const pending = deferred<WebSnapshot>();
+      client.snapshots.push(Promise.resolve(snapshot()), pending.promise);
+      const cancel = vi
+        .spyOn(client, "cancelActiveTurn")
+        .mockResolvedValue({ state: "accepted" });
+      const stream = eventStreamHarness();
+      const store = createWebStore(client, {
+        consumeEvents: stream.consumeEvents,
+      });
+      const turn = {
+        sessionId: "session-1",
+        commandId: "healthy-turn",
+        epoch: 4,
+      };
+      await store.getState().actions.refreshSnapshot();
+      store.getState().actions.start();
+      try {
+        const refreshing = store.getState().actions.refreshSnapshot();
+        expect(client.snapshotPaths).toHaveLength(2);
+        if (order === "before") {
+          pending.resolve(snapshot("Held idle"));
+          await refreshing;
+        }
+        stream.emit(runtimeEvent(5, "turn_started", turn));
+        expect(store.getState().connection).toBe("connected");
+        expect(store.getState().cursor).toBe(5);
+        expect(store.getState().activeTurn).toEqual(turn);
+        expect(store.getState().liveRunning).toBe(true);
+        await vi.advanceTimersByTimeAsync(159);
+        expect(client.snapshotPaths).toHaveLength(2);
+        if (order === "after") {
+          pending.resolve(snapshot("Held idle"));
+          await refreshing;
+        }
+        expect(store.getState().cursor).toBe(5);
+        expect.soft(store.getState().activeTurn).toEqual(turn);
+        if (order === "after") {
+          expect
+            .soft(store.getState().snapshot?.sessions[0]?.name)
+            .toBe("Current");
+        }
+        expect.soft(store.getState().liveRunning).toBe(true);
+        expect.soft(store.getState().livePhase).toBe("running");
+        await store.getState().actions.cancelActiveTurn();
+        expect.soft(cancel).toHaveBeenCalledExactlyOnceWith(turn);
+        // A snapshot covering the accepted event can reconcile normally.
+        const recovered = snapshot("Fresh running");
+        recovered.cursor = 5;
+        recovered.runtime = {
+          ...recovered.runtime,
+          status: "running",
+          activeTurn: turn,
+        };
+        client.snapshots.push(Promise.resolve(recovered));
+        await vi.advanceTimersByTimeAsync(1);
+        expect(client.snapshotPaths).toHaveLength(3);
+        expect(store.getState().activeTurn).toEqual(turn);
+      } finally {
+        store.getState().actions.stop();
+      }
+    },
+  );
+
+  it("retains healthy SSE turn through the production parser after stale HTTP", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const pending = deferred<WebSnapshot>();
+    client.snapshots.push(Promise.resolve(snapshot()), pending.promise);
+    const cancel = vi
+      .spyOn(client, "cancelActiveTurn")
+      .mockResolvedValue({ state: "accepted" });
+    const delivered = deferred<void>();
+    const turn = {
+      sessionId: "session-1",
+      commandId: "healthy-turn",
+      epoch: 4,
+    };
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const closed = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+      cancel: closed,
+    });
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    let consuming: Promise<void> | undefined;
+    const store = createWebStore(client, {
+      consumeEvents(options) {
+        consuming = consumeEventStream({
+          ...options,
+          onEvent(event) {
+            options.onEvent(event);
+            delivered.resolve();
+          },
+        });
+        return consuming;
+      },
+    });
+    await store.getState().actions.refreshSnapshot();
+    store.getState().actions.start();
+    try {
+      const refreshing = store.getState().actions.refreshSnapshot();
+      controller.enqueue(
+        new TextEncoder().encode(
+          `id: 5\ndata: ${JSON.stringify(runtimeEvent(5, "turn_started", turn))}\n\n`,
+        ),
+      );
+      await delivered.promise;
+      expect(fetcher).toHaveBeenCalledExactlyOnceWith(
+        "/events?cursor=4",
+        expect.any(Object),
+      );
+      expect(store.getState().connection).toBe("connected");
+      expect(store.getState().activeTurn).toEqual(turn);
+      await vi.advanceTimersByTimeAsync(159);
+      expect(client.snapshotPaths).toHaveLength(2);
+      pending.resolve(snapshot("Held idle"));
+      await refreshing;
+      expect(store.getState().cursor).toBe(5);
+      expect.soft(store.getState().activeTurn).toEqual(turn);
+      expect.soft(store.getState().liveRunning).toBe(true);
+      await store.getState().actions.cancelActiveTurn();
+      expect.soft(cancel).toHaveBeenCalledExactlyOnceWith(turn);
+    } finally {
+      store.getState().actions.stop();
+      await consuming?.catch(() => undefined);
+      expect(closed).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("does not resurrect a settled SSE turn from a pending running snapshot", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const pending = deferred<WebSnapshot>();
+    client.snapshots.push(Promise.resolve(snapshot()), pending.promise);
+    const cancel = vi
+      .spyOn(client, "cancelActiveTurn")
+      .mockResolvedValue({ state: "accepted" });
+    const stream = eventStreamHarness();
+    const store = createWebStore(client, {
+      consumeEvents: stream.consumeEvents,
+    });
+    const turn = {
+      sessionId: "session-1",
+      commandId: "healthy-turn",
+      epoch: 4,
+    };
+    await store.getState().actions.refreshSnapshot();
+    store.getState().actions.start();
+    try {
+      stream.emit(runtimeEvent(5, "turn_started", turn));
+      const refreshing = store.getState().actions.refreshSnapshot();
+      stream.emit(
+        runtimeEvent(6, "turn_settled", { ...turn, outcome: "completed" }),
+      );
+      expect(store.getState().activeTurn).toBeNull();
+      const stale = snapshot("Stale running");
+      stale.cursor = 5;
+      stale.runtime = { ...stale.runtime, status: "running", activeTurn: turn };
+      pending.resolve(stale);
+      expect.soft(await refreshing).toBe(false);
+      expect(store.getState().cursor).toBe(6);
+      expect.soft(store.getState().activeTurn).toBeNull();
+      expect.soft(store.getState().liveRunning).toBe(false);
+      expect.soft(store.getState().snapshot?.sessions[0]?.name).toBe("Current");
+      await store.getState().actions.cancelActiveTurn();
+      expect.soft(cancel).not.toHaveBeenCalled();
+    } finally {
+      store.getState().actions.stop();
+    }
+  });
+
+  it.each([false, true])(
+    "accepts a lower snapshot cursor only for explicit reset (resetCursor=%s)",
+    async (resetCursor) => {
+      const client = new FakeClient();
+      const current = snapshot("Before restart");
+      current.cursor = 9;
+      current.runtime = {
+        ...current.runtime,
+        status: "running",
+        activeTurn: {
+          sessionId: "session-1",
+          commandId: "old-host-turn",
+          epoch: 4,
+        },
+      };
+      client.snapshots.push(
+        Promise.resolve(current),
+        Promise.resolve(snapshot("Restarted")),
+      );
+      const store = createWebStore(client);
+      await store.getState().actions.refreshSnapshot();
+      expect(
+        await store.getState().actions.refreshSnapshot({ resetCursor }),
+      ).toBe(resetCursor);
+      expect(store.getState().cursor).toBe(resetCursor ? 4 : 9);
+      expect(store.getState().liveRunning).toBe(!resetCursor);
+      expect(store.getState().snapshot?.sessions[0]?.name).toBe(
+        resetCursor ? "Restarted" : "Before restart",
+      );
+    },
+  );
+
+  it("reconciles a new controller while message updates overtake each snapshot", async () => {
+    vi.useFakeTimers();
+    const client = new FakeClient();
+    const activation = deferred<SessionMutationResult>();
+    const pending = deferred<WebSnapshot>();
+    client.selectionResults.push(activation.promise);
+    client.snapshots.push(Promise.resolve(snapshot()), pending.promise);
+    const stream = eventStreamHarness();
+    const store = createWebStore(client, {
+      consumeEvents: stream.consumeEvents,
+    });
+    const turn = {
+      sessionId: "session-2",
+      commandId: "new-controller-turn",
+      epoch: 5,
+    };
+    const next = (cursor: number) => {
+      const value = activeSnapshot("session-2", "/tmp/ws/b.jsonl", {
+        cursor,
+        name: `Updated ${cursor}`,
+      });
+      value.runtime = { ...value.runtime, status: "running", activeTurn: turn };
+      return value;
+    };
+    const message = (sequence: number) =>
+      stream.emit(
+        runtimeEvent(sequence, "message_update", {
+          sessionId: "session-2",
+          sessionPath: "/tmp/ws/b.jsonl",
+          messageKey: "streaming",
+          message: { role: "assistant", content: `Chunk ${sequence}` },
+        }),
+      );
+    const cancel = vi
+      .spyOn(client, "cancelActiveTurn")
+      .mockResolvedValue({ state: "accepted" });
+    await store.getState().actions.refreshSnapshot();
+    store.getState().actions.start();
+    try {
+      const selecting = store
+        .getState()
+        .actions.selectSession("/tmp/ws/b.jsonl");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.selections).toEqual(["/tmp/ws/b.jsonl"]);
+      stream.emit(
+        runtimeEvent(5, "session_switched", {
+          sessionId: "session-2",
+          sessionPath: "/tmp/ws/b.jsonl",
+        }),
+      );
+      activation.resolve({});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.snapshotPaths).toHaveLength(2);
+      expect(store.getState().sessionSwitching).toBe(true);
+      message(6);
+      pending.resolve(next(5));
+      await selecting;
+      expect
+        .soft(store.getState().snapshot?.currentSessionId)
+        .toBe("session-2");
+      expect.soft(store.getState().activeTurn).toEqual(turn);
+      // Each heartbeat response is valid, but its cursor was captured before
+      // the next message chunk. Reconciliation must not require stream silence.
+      for (const cursor of [6, 7]) {
+        const reading = deferred<WebSnapshot>();
+        client.snapshots.push(reading.promise);
+        stream.consumeEvents.mock.calls[0]![0].onHeartbeat?.();
+        await vi.advanceTimersByTimeAsync(160);
+        expect(client.snapshotPaths).toHaveLength(cursor - 3);
+        message(cursor + 1);
+        reading.resolve(next(cursor));
+        await vi.advanceTimersByTimeAsync(0);
+        expect
+          .soft(store.getState().snapshot?.sessions[0]?.name)
+          .toBe(`Updated ${cursor}`);
+      }
+      expect(store.getState().cursor).toBe(8);
+      expect.soft(store.getState().selectedPath).toBe("/tmp/ws/b.jsonl");
+      await store.getState().actions.cancelActiveTurn();
+      expect.soft(cancel).toHaveBeenCalledExactlyOnceWith(turn);
+    } finally {
+      store.getState().actions.stop();
+    }
+  });
+
+  it("clears applied turn ordering on an explicit host cursor reset", async () => {
+    const client = new FakeClient();
+    const restarted = snapshot("Restarted");
+    restarted.cursor = 0;
+    const fresh = snapshot("Fresh host");
+    fresh.cursor = 1;
+    client.snapshots.push(
+      Promise.resolve(snapshot()),
+      Promise.resolve(restarted),
+      Promise.resolve(fresh),
+    );
+    const stream = eventStreamHarness();
+    const store = createWebStore(client, {
+      consumeEvents: stream.consumeEvents,
+    });
+    await store.getState().actions.refreshSnapshot();
+    store.getState().actions.start();
+    try {
+      stream.emit(
+        runtimeEvent(5, "turn_started", {
+          sessionId: "session-1",
+          commandId: "old-host-turn",
+          epoch: 4,
+        }),
+      );
+      expect(store.getState().activeTurn?.commandId).toBe("old-host-turn");
+      store.getState().actions.stop();
+      expect(
+        await store.getState().actions.refreshSnapshot({ resetCursor: true }),
+      ).toBe(true);
+      expect(store.getState().cursor).toBe(0);
+      expect(store.getState().activeTurn).toBeNull();
+      expect(await store.getState().actions.refreshSnapshot()).toBe(true);
+      expect(store.getState().cursor).toBe(1);
+      expect(store.getState().snapshot?.sessions[0]?.name).toBe("Fresh host");
+    } finally {
+      store.getState().actions.stop();
+    }
+  });
+
+  it.each(["agent_start", "agent_settled"])(
+    "protects an applied %s even when its running value is unchanged",
+    async (type) => {
+      const client = new FakeClient();
+      const pending = deferred<WebSnapshot>();
+      const running = type === "agent_start";
+      const initial = snapshot();
+      initial.runtime.status = running ? "running" : "idle";
+      client.snapshots.push(Promise.resolve(initial), pending.promise);
+      const stream = eventStreamHarness();
+      const store = createWebStore(client, {
+        consumeEvents: stream.consumeEvents,
+      });
+      await store.getState().actions.refreshSnapshot();
+      store.getState().actions.start();
+      try {
+        const refreshing = store.getState().actions.refreshSnapshot();
+        stream.emit(runtimeEvent(5, type, { sessionId: "session-1" }));
+        expect(store.getState().liveRunning).toBe(running);
+        const stale = snapshot();
+        stale.runtime.status = running ? "idle" : "running";
+        pending.resolve(stale);
+        expect.soft(await refreshing).toBe(false);
+        expect.soft(store.getState().liveRunning).toBe(running);
+      } finally {
+        store.getState().actions.stop();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "orders a prompt settlement only when it applies idle state (running=%s)",
+    async (running) => {
+      vi.useFakeTimers();
+      const client = new FakeClient();
+      const pending = deferred<WebSnapshot>();
+      client.snapshots.push(Promise.resolve(snapshot()), pending.promise);
+      const stream = eventStreamHarness();
+      const store = createWebStore(client, {
+        consumeEvents: stream.consumeEvents,
+      });
+      const turn = { sessionId: "session-1", commandId: "prompt-1", epoch: 4 };
+      await store.getState().actions.refreshSnapshot();
+      store.getState().actions.start();
+      try {
+        stream.emit(runtimeEvent(5, "prompt_accepted", turn));
+        if (running) stream.emit(runtimeEvent(6, "turn_started", turn));
+        const cursor = running ? 6 : 5;
+        expect(store.getState().livePhase).toBe(
+          running ? "running" : "preparing",
+        );
+        const refreshing = store.getState().actions.refreshSnapshot();
+        stream.emit(runtimeEvent(cursor + 1, "prompt_settled", turn));
+        expect(store.getState().liveRunning).toBe(running);
+        const held = snapshot("Held running");
+        held.cursor = cursor;
+        held.runtime = {
+          ...held.runtime,
+          status: "running",
+          ...(running ? { activeTurn: turn } : {}),
+        };
+        pending.resolve(held);
+        expect.soft(await refreshing).toBe(running);
+        expect.soft(store.getState().liveRunning).toBe(running);
+        expect
+          .soft(store.getState().livePhase)
+          .toBe(running ? "running" : "idle");
+        expect(store.getState().cursor).toBe(cursor + 1);
+      } finally {
+        store.getState().actions.stop();
+      }
+    },
+  );
 
   it("prevents an older snapshot response from overwriting newer state", async () => {
     const client = new FakeClient();
@@ -2730,7 +3147,7 @@ describe("OpenPI Web store", () => {
     const client = new FakeClient();
     client.snapshots.push(
       Promise.resolve(snapshot()),
-      Promise.resolve(snapshot("Renamed elsewhere")),
+      Promise.resolve({ ...snapshot("Renamed elsewhere"), cursor: 5 }),
     );
     const stream = eventStreamHarness();
     const store = createWebStore(client, {
@@ -2964,7 +3381,9 @@ describe("OpenPI Web store", () => {
     const client = new FakeClient();
     client.snapshots.push(
       Promise.resolve(unboundSnapshot()),
-      Promise.resolve(activeSnapshot("session-new", "current:session-new")),
+      Promise.resolve(
+        activeSnapshot("session-new", "current:session-new", { cursor: 6 }),
+      ),
     );
     const creation = deferred<SessionCreationResult>();
     client.creationResult = () => creation.promise;

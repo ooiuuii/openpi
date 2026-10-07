@@ -354,6 +354,8 @@ export function createWebStore(
   let navigationSequence = 0;
   let forkRequest: WebSessionForkRequest | null = null;
   let snapshotGeneration = 0;
+  // Latest event whose turn-state projection was applied (not stream progress).
+  let runtimeEventCursor = 0;
   let snapshotFailureNotice: string | null = null;
   let promptAdmissionSequence = 0;
   let promptAdmissionToken: number | null = null;
@@ -939,6 +941,7 @@ export function createWebStore(
           });
         }
       } else if (event.type === "prompt_accepted") {
+        runtimeEventCursor = event.sequence;
         const settled = terminalPromptIds.has(String(detail.commandId ?? ""));
         set({
           ...promptAcceptedLivePatch(settled, current.livePhase),
@@ -951,6 +954,7 @@ export function createWebStore(
             : current.pendingSteeringReceipt,
         });
       } else if (event.type === "turn_started") {
+        runtimeEventCursor = event.sequence;
         set({
           activeTurn: {
             sessionId: String(detail.sessionId),
@@ -963,6 +967,7 @@ export function createWebStore(
           turnTerminalStatus: null,
         });
       } else if (event.type === "agent_start") {
+        runtimeEventCursor = event.sequence;
         set({
           ...(detail.activeTurn
             ? { activeTurn: detail.activeTurn as WebStoreState["activeTurn"] }
@@ -979,6 +984,7 @@ export function createWebStore(
           turn?.commandId === detail.commandId &&
           turn?.epoch === detail.epoch
         ) {
+          runtimeEventCursor = event.sequence;
           set({
             activeTurn: null,
             liveRunning: false,
@@ -989,6 +995,7 @@ export function createWebStore(
           });
         }
       } else if (event.type === "agent_settled") {
+        if (!current.activeTurn) runtimeEventCursor = event.sequence;
         set({
           pendingFollowUpsReceipt: null,
           pendingSteeringReceipt: null,
@@ -1002,8 +1009,10 @@ export function createWebStore(
         });
       } else if (event.type === "prompt_settled") {
         rememberBounded(terminalPromptIds, detail.commandId);
-        if (current.livePhase !== "running")
+        if (current.livePhase !== "running") {
+          runtimeEventCursor = event.sequence;
           set({ liveRunning: false, livePhase: "idle", liveRetry: null });
+        }
       } else if (detail.message && typeof detail.message === "object") {
         const message = detail.message as WebLiveMessage;
         let liveMessages = current.liveMessages;
@@ -1046,6 +1055,8 @@ export function createWebStore(
         const failedActiveTurn =
           typeof detail.commandId === "string" &&
           current.activeTurn?.commandId === detail.commandId;
+        if (failedActiveTurn || current.livePhase !== "running")
+          runtimeEventCursor = event.sequence;
         set({
           liveMessages: get().liveMessages.filter(
             (entry) =>
@@ -1064,6 +1075,7 @@ export function createWebStore(
         });
       }
       if (event.type === "auto_retry_start") {
+        runtimeEventCursor = event.sequence;
         set({
           liveRunning: true,
           livePhase: "running",
@@ -1074,6 +1086,7 @@ export function createWebStore(
         });
       }
       if (event.type === "auto_retry_end") {
+        runtimeEventCursor = event.sequence;
         // A recovered request can continue into tools or another model step.
         // Only Pi's settled event ends the run.
         set({ liveRetry: null });
@@ -1225,6 +1238,14 @@ export function createWebStore(
               : await client.snapshot(requestedPath);
           if (epoch !== sessionEpoch || generation !== snapshotGeneration)
             return false;
+          // Preserve applied turn facts, not every received event: message
+          // chunks may keep arriving while controller metadata is being read.
+          const acceptedCursor = Math.max(
+            get().snapshot?.cursor ?? 0,
+            runtimeEventCursor,
+          );
+          if (!options.resetCursor && snapshot.cursor < acceptedCursor)
+            return false;
           const hasCurrent = typeof snapshot.currentSessionId === "string";
           const currentSession = hasCurrent
             ? snapshot.sessions.find((session) =>
@@ -1288,6 +1309,7 @@ export function createWebStore(
             clearThinkingGate();
           }
           if (shouldReset) {
+            runtimeEventCursor = 0;
             // A cursor reset means a fresh stream (e.g. host restart), whose
             // sequence restarts at 0. The old revision gate would reject every
             // projection below the old floor and freeze the picker.
