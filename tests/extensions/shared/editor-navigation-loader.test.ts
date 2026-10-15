@@ -314,6 +314,6 @@ test("native extension graphs cycle management strips through the composed edito
     for (const widget of widgets.values()) widget.dispose?.();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-    await rm(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 5 });
   }
 });
