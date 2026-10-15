@@ -263,22 +263,18 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
       .getByRole("button", { name: /关闭预览|Close preview/u })
       .click();
     await expect(page.locator(".session-changes-trigger")).toHaveCount(0);
-    for (const group of await page.locator(".process-sequence > summary").all())
-      await group.click();
-    for (const summary of await page
-      .locator(".tool-evidence-card > summary")
-      .all())
-      await summary.click();
-    const readCard = page
-      .locator(".tool-evidence-card")
-      .filter({ has: page.locator("summary strong", { hasText: "read" }) });
+    for (const group of await page.locator(".process-sequence").all())
+      if ((await group.getAttribute("open")) === null)
+        await group.locator(":scope > summary").click();
+    for (const card of await page.locator(".tool-evidence-card").all())
+      if ((await card.getAttribute("open")) === null)
+        await card.locator(":scope > summary").click();
+    const readCard = page.locator('.tool-evidence-card[data-tool="read"]');
     const toolTitleColors = await readCard
       .locator(":scope > summary")
       .evaluate((summary) => {
-        const label = summary.querySelector<HTMLElement>(".tool-name");
-        const detail = summary.querySelector<HTMLElement>(
-          ":scope > span:not(.evidence-status):not(.evidence-summary-meta)",
-        );
+        const label = summary.querySelector<HTMLElement>(".tool-kind");
+        const detail = summary.querySelector<HTMLElement>(".evidence-filename");
         return {
           label: label ? getComputedStyle(label).color : "",
           detail: detail ? getComputedStyle(detail).color : "",
@@ -297,13 +293,10 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
     ).toContainText("Initial content");
     await expect(
       page
-        .locator(".tool-evidence-card")
-        .filter({ has: page.locator("summary strong", { hasText: "edit" }) })
+        .locator('.tool-evidence-card[data-tool="edit"]')
         .getByRole("figure", { name: "Change diff" }),
     ).toContainText("Reviewed content");
-    const writeCard = page
-      .locator(".tool-evidence-card")
-      .filter({ has: page.locator("summary strong", { hasText: "write" }) });
+    const writeCard = page.locator('.tool-evidence-card[data-tool="write"]');
     await expect(writeCard).toContainText(
       "reading the previous contents was not authorized",
     );
@@ -312,8 +305,14 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
     ).toHaveCount(0);
     await expect(
       page.getByRole("figure", { name: "Test evidence" }),
-    ).toContainText("1 failed");
-    await expect(page.locator(".evidence-terminal")).toContainText("cancelled");
+    ).toContainText(/1 (?:failed|失败)/u);
+    await expect(page.locator(".evidence-terminal")).toHaveAttribute(
+      "data-state",
+      "cancelled",
+    );
+    await expect(page.locator(".evidence-terminal")).toContainText(
+      /已停止|Stopped/u,
+    );
     expect(
       (await new AxeBuilder({ page }).include(".tool-evidence-card").analyze())
         .violations,
@@ -330,9 +329,9 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
       .getByRole("button", { name: /打开工具|Open tools/u, exact: true })
       .click();
     await workbar.locator(".workbar-add-tab").click();
-    await workbar
-      .locator(".workbar-launcher")
-      .getByRole("button", { name: /^(?:变更|Changes)/u })
+    await page
+      .getByRole("menu", { name: /打开工具|Open tools/u })
+      .getByRole("menuitem", { name: /^(?:变更|Changes)/u })
       .click();
     const review = page.getByRole("complementary", {
       name: /变更|Changes/u,
@@ -356,15 +355,17 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
     await expect(
       review.getByRole("figure", { name: /变更差异|Change diff/u }),
     ).toContainText("Reviewed content");
-    await review.getByRole("button", { name: /^(?:关闭|Close)$/u }).click();
+    await workbar
+      .getByRole("button", { name: /收起工具栏|Collapse tools/u })
+      .click();
     await page.setViewportSize({ width: 390, height: 844 });
     await page
       .getByRole("button", { name: /打开工具|Open tools/u, exact: true })
       .click();
     await workbar.locator(".workbar-add-tab").click();
-    await workbar
-      .locator(".workbar-launcher")
-      .getByRole("button", { name: /^(?:变更|Changes)/u })
+    await page
+      .getByRole("menu", { name: /打开工具|Open tools/u })
+      .getByRole("menuitem", { name: /^(?:变更|Changes)/u })
       .click();
     const mobileReview = page.getByRole("complementary", {
       name: /变更|Changes/u,
@@ -381,8 +382,8 @@ test("real file evidence, authenticated downloads, edits, refresh and failure st
         (element) => element.scrollWidth <= element.clientWidth,
       ),
     ).toBe(true);
-    await mobileReview
-      .getByRole("button", { name: /^(?:关闭|Close)$/u })
+    await workbar
+      .getByRole("button", { name: /收起工具栏|Collapse tools/u })
       .click();
     await page.setViewportSize({ width: 1280, height: 844 });
     await page.getByRole("button", { name: "Report", exact: true }).click();

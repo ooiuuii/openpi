@@ -1,14 +1,26 @@
-import { Menu, PanelLeftOpen, PanelRight, RefreshCw, X } from "lucide-react";
+import {
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRight,
+  RefreshCw,
+  X,
+} from "lucide-react";
 import {
   type CSSProperties,
   useCallback,
   useEffect,
+  useEffectEvent,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useStore } from "zustand";
+import type {
+  WebHistoryAnchor,
+  WebSessionProjection,
+} from "../../../protocol/types.ts";
 import { OpenPiLogo } from "../components/OpenPiLogo.tsx";
 import { PaneResizeHandle } from "../components/PaneResizeHandle.tsx";
 import {
@@ -26,27 +38,30 @@ import {
 } from "../features/questions/QuestionPanel.tsx";
 import type { DiffLineReference } from "../features/review/DiffCodePreview.tsx";
 import { useGitReview } from "../features/review/use-git-review.ts";
+import { ArchiveNotifications } from "../features/sessions/ArchiveNotifications.tsx";
 import { SessionSidebar } from "../features/sessions/SessionSidebar.tsx";
-import { ProviderSettingsPage } from "../features/settings/ProviderSettingsPage.tsx";
+import {
+  ProviderSettingsPage,
+  settingsSectionFromUrl,
+  type SettingsSection,
+} from "../features/settings/ProviderSettingsPage.tsx";
 import { recordedSubagents } from "../features/subagents/recorded-subagents.ts";
 import { SessionOverview } from "../features/subagents/SessionOverview.tsx";
 import { SubagentPanel } from "../features/subagents/SubagentPanel.tsx";
 import { subagentOverview } from "../features/subagents/subagent-overview.ts";
+import {
+  loadSubagentPanelPosition,
+  saveSubagentPanelPosition,
+} from "../features/subagents/subagent-panel-position.ts";
 import { Trajectory } from "../features/trajectory/Trajectory.tsx";
 import {
   createSessionReadingCache,
   type ReadingPosition,
   sessionReadingScope,
 } from "../features/transcript/session-reading-state.ts";
-import type {
-  WebHistoryAnchor,
-  WebSessionProjection,
-} from "../../../protocol/types.ts";
-import { WebClient } from "../protocol/client.ts";
-import {
-  type CompletedResultExposure,
-  Transcript,
-} from "../features/transcript/Transcript.tsx";
+import { Transcript } from "../features/transcript/Transcript.tsx";
+import { useBrowserConnector } from "../features/workbar/browser-connector.ts";
+import { useBrowserControl } from "../features/workbar/browser-control.ts";
 import { SessionUsageBar } from "../features/workbar/SessionUsageBar.tsx";
 import type { WorkbarTool } from "../features/workbar/types.ts";
 import { WorkbarPanel } from "../features/workbar/WorkbarPanel.tsx";
@@ -57,11 +72,12 @@ import {
 } from "../features/workbar/workbar-position-storage.ts";
 import { sessionTitle, workspaceName } from "../lib/format.ts";
 import { isControlledSession } from "../lib/session-control.ts";
+import { WebClient } from "../protocol/client.ts";
 import { webStore } from "../store/web-store.ts";
 
-const SIDEBAR_DEFAULT_WIDTH = 280;
+const SIDEBAR_DEFAULT_WIDTH = 340;
 const SIDEBAR_MIN_WIDTH = 220;
-const SIDEBAR_MAX_WIDTH = 420;
+const SIDEBAR_MAX_WIDTH = 520;
 const SIDEBAR_COLLAPSE_THRESHOLD = 190;
 const AUXILIARY_DEFAULT_WIDTH = 520;
 const AUXILIARY_MIN_WIDTH = 360;
@@ -76,33 +92,8 @@ function clamp(value: number, min: number, max: number) {
 }
 
 export function App() {
+  useBrowserConnector();
   const state = useStore(webStore);
-  const [completedResultSeen, setCompletedResultSeen] =
-    useState<CompletedResultExposure | null>(null);
-  const reportCompletedResultSeen = useCallback(
-    (exposure: CompletedResultExposure) => {
-      const current = webStore.getState();
-      const session = current.snapshot?.selectedSession;
-      const turn = current.snapshot?.sessions.find(
-        (summary) =>
-          summary.id === session?.id && summary.path === session?.path,
-      )?.execution?.lastTurn;
-      if (
-        current.workspaceDraft ||
-        current.sessionSwitching ||
-        current.selectedPath !== exposure.sessionPath ||
-        session?.id !== exposure.sessionId ||
-        session.path !== exposure.sessionPath ||
-        turn?.outcome !== "completed" ||
-        turn.commandId !== exposure.commandId ||
-        turn.finishedAt !== exposure.finishedAt ||
-        turn.resultEntryId !== exposure.resultEntryId
-      )
-        return;
-      setCompletedResultSeen(exposure);
-    },
-    [],
-  );
   const { t } = useTranslation();
   const { actions } = state;
   const sidebarTrigger = useRef<HTMLButtonElement>(null);
@@ -112,6 +103,15 @@ export function App() {
   const providerSettingsTrigger = useRef<HTMLElement | null>(null);
   const workbarReturnFocus = useRef<HTMLElement | null>(null);
   const artifactProvider = useRef<ArtifactProviderHandle>(null);
+  const browserOpener = useRef<
+    ((url: string) => string | undefined) | undefined
+  >(undefined);
+  const browserReady = useCallback(
+    (open: ((url: string) => string | undefined) | undefined) => {
+      browserOpener.current = open;
+    },
+    [],
+  );
   const readingCache = useMemo(createSessionReadingCache, []);
   const readingRestored = useRef(new Set<string>());
   const [, updateReadingRestore] = useState(0);
@@ -202,7 +202,7 @@ export function App() {
     sessionId: string;
     sessionPath: string;
     cwd: string;
-    entry: "general" | "credentials";
+    entry: SettingsSection | "credentials";
   } | null>(null);
   const [workbarWorkspaces, setWorkbarWorkspaces] =
     useState<WorkbarWorkspace[]>(loadWorkbarPositions);
@@ -260,10 +260,11 @@ export function App() {
     sessionId: string;
     sessionPath: string;
     id?: string;
+    kind?: "workflows";
     navigation: number;
-  } | null>(null);
+  } | null>(loadSubagentPanelPosition);
   const inspectSubagent = useCallback(
-    (id?: string) => {
+    (id?: string, kind?: "workflows") => {
       const current = webStore.getState();
       const session = current.snapshot?.selectedSession;
       if (
@@ -285,6 +286,7 @@ export function App() {
         sessionId: session.id,
         sessionPath: session.path,
         id,
+        kind,
         navigation: (previous?.navigation ?? 0) + 1,
       }));
     },
@@ -297,8 +299,15 @@ export function App() {
     subagentTarget.sessionId === state.snapshot?.selectedSession?.id &&
     subagentTarget.sessionPath === state.snapshot?.selectedSession?.path;
   useEffect(() => {
-    if (subagentTarget && !subagentVisible) setSubagentTarget(null);
-  }, [subagentTarget, subagentVisible]);
+    if (
+      state.snapshot &&
+      !state.sessionSwitching &&
+      subagentTarget &&
+      !subagentVisible
+    )
+      setSubagentTarget(null);
+  }, [state.snapshot, state.sessionSwitching, subagentTarget, subagentVisible]);
+  useEffect(() => saveSubagentPanelPosition(subagentTarget), [subagentTarget]);
   useEffect(() => {
     if (subagentVisible || !auxiliaryOpen.current) return;
     auxiliaryOpen.current = false;
@@ -367,7 +376,7 @@ export function App() {
     if (providerSettings && !providerSettingsVisible) setProviderSettings(null);
   }, [providerSettings, providerSettingsVisible]);
   const openProviderSettings = async (
-    entry: "general" | "credentials" = "general",
+    entry: SettingsSection | "credentials" = "general",
   ) => {
     providerSettingsTrigger.current =
       document.activeElement instanceof HTMLElement
@@ -401,6 +410,9 @@ export function App() {
   };
   const closeProviderSettings = useCallback(() => {
     setProviderSettings(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("settings");
+    window.history.replaceState(window.history.state, "", url);
     requestAnimationFrame(() => {
       const trigger = providerSettingsTrigger.current;
       providerSettingsTrigger.current = null;
@@ -599,8 +611,22 @@ export function App() {
     ? state.snapshot?.runtime.capabilities.subagents
     : undefined;
   const overviewAgents = useMemo(
-    () => subagentOverview(liveSubagents?.items ?? [], savedSubagents),
-    [liveSubagents?.items, savedSubagents],
+    () =>
+      subagentOverview(
+        liveSubagents?.items ?? [],
+        savedSubagents,
+        controlled
+          ? state.snapshot?.runtime.capabilities.workflows?.items
+          : undefined,
+        state.connection === "connected",
+      ),
+    [
+      liveSubagents?.items,
+      savedSubagents,
+      controlled,
+      state.snapshot?.runtime.capabilities.workflows?.items,
+      state.connection,
+    ],
   );
   const execution = state.snapshot?.selectedExecution;
   const selectedExecution =
@@ -689,6 +715,38 @@ export function App() {
       if (trigger?.isConnected && trigger.checkVisibility()) trigger.focus();
     });
   };
+  const browserScope =
+    !state.sessionSwitching &&
+    !state.workspaceDraft &&
+    isControlledSession(state.snapshot, selected)
+      ? selected
+      : undefined;
+  useBrowserControl(
+    browserScope?.id,
+    browserScope?.path,
+    async (url, signal) => {
+      openWorkbar("browser");
+      const deadline = Date.now() + 5000;
+      while (!browserOpener.current && !signal.aborted && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      return signal.aborted ? undefined : browserOpener.current?.(url);
+    },
+  );
+  const settingsLink = useRef(
+    settingsSectionFromUrl(
+      new URLSearchParams(location.search).get("settings"),
+    ),
+  );
+  const openSettingsFromLink = useEffectEvent((section: SettingsSection) => {
+    void openProviderSettings(section);
+  });
+  useEffect(() => {
+    if (!settingsLink.current || !state.snapshot || state.sessionSwitching)
+      return;
+    const section = settingsLink.current;
+    settingsLink.current = undefined;
+    openSettingsFromLink(section);
+  }, [state.snapshot, state.sessionSwitching]);
   const auxiliaryVisible = Boolean(
     subagentVisible || workbarVisible || artifactPanelOpen,
   );
@@ -777,7 +835,13 @@ export function App() {
           state.snapshot.selectedExecution.compaction
         )));
   const resend = useCallback(
-    (content: string) => actions.sendPrompt(content),
+    (content: string, retryEntryId?: string) =>
+      retryEntryId
+        ? actions.sendPrompt("", [], undefined, {
+            streamingBehavior: "followUp",
+            retryEntryId,
+          })
+        : actions.sendPrompt(content),
     [actions],
   );
 
@@ -810,7 +874,13 @@ export function App() {
           }}
         >
           <SessionSidebar
-            completedResultSeen={completedResultSeen}
+            sessionViewVisible={
+              view === "chat" &&
+              !centerCollapsed &&
+              !providerSettingsVisible &&
+              !state.sessionSwitching &&
+              !state.workspaceDraft
+            }
             connected={state.connection === "connected"}
             snapshot={state.snapshot}
             selectedPath={state.workspaceDraft ? null : state.selectedPath}
@@ -845,15 +915,23 @@ export function App() {
           >
             <header className="task-header">
               <button
-                className="task-header-menu"
+                className="task-header-menu sidebar-shell-toggle"
                 ref={sidebarTrigger}
                 type="button"
-                aria-label={t("openSidebar")}
+                aria-label={t(
+                  narrow
+                    ? "openSidebar"
+                    : state.sidebarCollapsed
+                      ? "expandSidebar"
+                      : "collapseSidebar",
+                )}
                 aria-controls="session-sidebar"
-                aria-expanded={mobileSidebarOpen}
-                onClick={() => actions.toggleSidebar(true)}
+                aria-expanded={
+                  narrow ? mobileSidebarOpen : !state.sidebarCollapsed
+                }
+                onClick={() => actions.toggleSidebar(narrow)}
               >
-                <Menu />
+                {narrow ? <Menu /> : <PanelLeftClose />}
               </button>
               <div className="task-identity">
                 {workspacePath && (
@@ -864,14 +942,40 @@ export function App() {
                 )}
                 <h1 title={taskTitle}>{taskTitle}</h1>
               </div>
-              <SessionUsageBar usage={state.snapshot?.usage} />
+              <SessionUsageBar
+                key={
+                  selected
+                    ? `usage:${selected.id}:${selected.path}`
+                    : "usage:no-session"
+                }
+                usage={
+                  selected && !state.sessionSwitching
+                    ? state.snapshot?.usage
+                    : undefined
+                }
+                workspace={
+                  workspace?.name || (selected && workspaceName(selected.cwd))
+                }
+                sessionId={selected?.id}
+              />
               {selected && !state.sessionSwitching && (
                 <SessionOverview
-                  key={`${selected.id}:${selected.path}`}
+                  key={`overview:${selected.id}:${selected.path}`}
                   sessionId={selected.id}
                   workspace={workspace?.name || workspaceName(selected.cwd)}
                   agents={overviewAgents}
-                  omitted={liveSubagents?.omitted ?? 0}
+                  omitted={
+                    (liveSubagents?.omitted ?? 0) +
+                    (controlled
+                      ? (
+                          state.snapshot?.runtime.capabilities.workflows
+                            ?.items ?? []
+                        ).reduce(
+                          (sum, item) => sum + (item.children?.omitted ?? 0),
+                          0,
+                        )
+                      : 0)
+                  }
                   review={gitReview.result}
                   reviewLoading={gitReview.loading}
                   reviewError={gitReview.error}
@@ -980,7 +1084,6 @@ export function App() {
               </section>
             ) : state.snapshot ? (
               <Transcript
-                onCompletedResultSeen={reportCompletedResultSeen}
                 resultExposureEnabled={
                   !centerCollapsed &&
                   !providerSettingsVisible &&
@@ -994,6 +1097,7 @@ export function App() {
                 snapshot={state.snapshot}
                 liveMessages={state.liveMessages}
                 liveRunning={state.liveRunning}
+                liveActiveTurn={state.activeTurn}
                 livePhase={state.livePhase}
                 activityObserved={state.connection === "connected"}
                 liveRetry={state.liveRetry}
@@ -1121,6 +1225,7 @@ export function App() {
                 }}
                 onInspectSubagent={inspectSubagent}
                 activeTurn={state.activeTurn}
+                activityObserved={state.connection === "connected"}
                 turnCancellationPending={state.turnCancellationPending}
                 turnTerminalStatus={state.turnTerminalStatus}
                 pendingFollowUpsReceipt={state.pendingFollowUpsReceipt}
@@ -1129,7 +1234,9 @@ export function App() {
                 snapshot={state.snapshot}
                 selectedPath={state.selectedPath}
                 selectedWorkspace={selected?.cwd ?? state.selectedWorkspace}
-                sessionSwitching={state.sessionSwitching}
+                sessionSwitching={
+                  state.sessionSwitching || state.sessionForkPending
+                }
                 promptAdmissionPending={state.promptAdmissionPending}
                 promptAdmissionRecovery={state.promptAdmissionRecovery}
                 promptAdmissionResolution={state.promptAdmissionResolution}
@@ -1139,6 +1246,36 @@ export function App() {
                 actions={actions}
               />
             )}
+            {state.sessionForkPending && (
+              <div className="session-fork-progress" role="status">
+                <span
+                  className="session-fork-progress-spinner"
+                  aria-hidden="true"
+                />
+                {t(
+                  state.sessionForkCancellation === "too-late"
+                    ? "sidebarForkFinishing"
+                    : state.sessionForkCancellation
+                      ? "sidebarForkCancelling"
+                      : state.sessionForkEnvironment === "worktree"
+                        ? "sidebarForkWorktreePending"
+                        : "forkSessionPending",
+                )}
+                {state.sessionForkEnvironment && (
+                  <button
+                    type="button"
+                    disabled={state.sessionForkCancellation !== null}
+                    onClick={() => void actions.cancelSessionFork()}
+                  >
+                    {t("cancel")}
+                  </button>
+                )}
+              </div>
+            )}
+            <ArchiveNotifications
+              notices={state.archiveNotices}
+              actions={actions}
+            />
             {state.notice && (
               <div
                 className={
@@ -1176,6 +1313,8 @@ export function App() {
               key={`${subagentTarget.sessionId}:${subagentTarget.navigation}`}
               sessionId={subagentTarget.sessionId}
               initialId={subagentTarget.id}
+              initialKind={subagentTarget.kind}
+              observed={state.connection === "connected"}
               activity={
                 isControlledSession(state.snapshot, {
                   id: subagentTarget.sessionId,
@@ -1185,6 +1324,11 @@ export function App() {
                   : undefined
               }
               records={savedSubagents}
+              workflows={
+                controlled
+                  ? state.snapshot?.runtime.capabilities.workflows
+                  : undefined
+              }
               liveAvailable={isControlledSession(state.snapshot, {
                 id: subagentTarget.sessionId,
                 path: subagentTarget.sessionPath,
@@ -1200,6 +1344,7 @@ export function App() {
               requestRevision={workbarTarget.requestRevision}
               sessionId={selected.id}
               sessionPath={selected.path}
+              onBrowserReady={browserReady}
               canControl={
                 !state.sessionSwitching &&
                 isControlledSession(state.snapshot, selected)
@@ -1208,6 +1353,7 @@ export function App() {
                 void actions.selectSession(selected.path)
               }
               cwd={selected.cwd}
+              snapshot={state.snapshot ?? undefined}
               capabilities={
                 isControlledSession(state.snapshot, selected)
                   ? (state.snapshot?.runtime.capabilities ?? {})
@@ -1306,6 +1452,9 @@ export function App() {
             t("unknownState")
           }
           theme={state.snapshot?.preferences.theme ?? "system"}
+          preferences={state.snapshot?.preferences}
+          workspaces={state.snapshot?.workspaces ?? []}
+          onRestoreSession={(path) => actions.unarchiveSession(path)}
           plan={state.snapshot?.runtime.plan}
           planSelectionPending={state.planSelectionPending}
           onExitPlan={() => actions.selectPlanMode(false)}
@@ -1325,7 +1474,8 @@ export function App() {
               : undefined
           }
           modelSelectionPending={state.modelSelectionPending}
-          onSelectModel={(value) => void actions.selectModel(value)}
+          sessionPath={providerSettings.sessionPath}
+          onSelectModel={(value) => actions.selectModel(value)}
           onConfigureOpenPi={configureOpenPiFromSettings}
           interaction={
             state.snapshot &&
