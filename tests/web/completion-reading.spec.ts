@@ -7,32 +7,24 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { createElement, Fragment, useState } from "react";
+import { createElement, Fragment } from "react";
 import { I18nextProvider } from "react-i18next";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { WebSnapshot } from "../../web/protocol/types.ts";
 import { App } from "../../web/ui/src/app/App.tsx";
 import { SessionSidebar } from "../../web/ui/src/features/sessions/SessionSidebar.tsx";
-import {
-  type CompletedResultExposure,
-  Transcript,
-} from "../../web/ui/src/features/transcript/Transcript.tsx";
+import { Transcript } from "../../web/ui/src/features/transcript/Transcript.tsx";
 import { i18n } from "../../web/ui/src/i18n.ts";
 import { createWebStore, webStore } from "../../web/ui/src/store/web-store.ts";
 
-const originalScrollTo = Object.getOwnPropertyDescriptor(
-  HTMLElement.prototype,
-  "scrollTo",
-);
-
 afterEach(() => {
   cleanup();
-  sessionStorage.clear();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  if (originalScrollTo)
-    Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
-  else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+});
+beforeEach(() => {
+  vi.spyOn(actions, "setSessionRead").mockResolvedValue();
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
 });
 
 const truncation = {
@@ -60,7 +52,7 @@ function snapshot(id = "A", commandId = "turn-1", finishedAt = 2): WebSnapshot {
     protocolVersion: 1,
     cursor: 1,
     generatedAt: "2026-09-30T00:00:00Z",
-    preferences: { theme: "system" },
+    preferences: { theme: "system", projectsInRecents: false },
     currentSessionId: id,
     currentSessionPath: path,
     runtime: { status: "idle", capabilities: {} },
@@ -80,6 +72,8 @@ function snapshot(id = "A", commandId = "turn-1", finishedAt = 2): WebSnapshot {
         created: "2026-09-30T00:00:00Z",
         firstMessage: "Question",
         messageCount: 2,
+        unread: true,
+        readRevision: `revision:${path}:${commandId}:${finishedAt}`,
         execution: {
           status: "idle",
           lastTurn: {
@@ -137,54 +131,19 @@ function snapshot(id = "A", commandId = "turn-1", finishedAt = 2): WebSnapshot {
   };
 }
 
-function geometry() {
-  let resultTop = 100;
-  let visibility = "visible";
-  let nextFrame = 0;
-  const frames = new Map<number, FrameRequestCallback>();
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-    frames.set(++nextFrame, callback);
-    return nextFrame;
-  });
-  const cancel = vi.fn((id: number) => frames.delete(id));
-  vi.stubGlobal("cancelAnimationFrame", cancel);
-  vi.spyOn(document, "visibilityState", "get").mockImplementation(
-    () => visibility as DocumentVisibilityState,
-  );
-  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
-    function (this: HTMLElement) {
-      if (this.classList.contains("conversation"))
-        return new DOMRect(0, 0, 400, 500);
-      if (this.classList.contains("message-content"))
-        return new DOMRect(0, resultTop, 400, 80);
-      return new DOMRect(0, 0, 400, 80);
-    },
-  );
-  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
-    configurable: true,
-    value: vi.fn(),
-  });
+function readSnapshot(value: WebSnapshot) {
   return {
-    cancel,
-    hide() {
-      visibility = "hidden";
-      fireEvent(document, new Event("visibilitychange"));
-    },
-    show() {
-      visibility = "visible";
-      fireEvent(document, new Event("visibilitychange"));
-    },
-    move(top: number) {
-      resultTop = top;
-      fireEvent(document.querySelector(".conversation")!, new Event("scroll"));
-    },
-    flush() {
-      act(() => {
-        const callbacks = [...frames.values()];
-        frames.clear();
-        for (const callback of callbacks) callback(performance.now());
-      });
-    },
+    ...value,
+    sessions: value.sessions.map((session) =>
+      session.path === value.selectedSession?.path &&
+      session.id === value.selectedSession?.id
+        ? {
+            ...session,
+            unread: false,
+            readRevision: `${session.readRevision}:read`,
+          }
+        : session,
+    ),
   };
 }
 
@@ -192,15 +151,14 @@ const actions = createWebStore().getState().actions;
 function Conversation({
   value,
   enabled = true,
-  showTranscript = true,
-  hidden = false,
+  selectedPath = value.selectedSession?.path ?? null,
+  connected = true,
 }: {
   value: WebSnapshot;
   enabled?: boolean;
-  showTranscript?: boolean;
-  hidden?: boolean;
+  selectedPath?: string | null;
+  connected?: boolean;
 }) {
-  const [seen, setSeen] = useState<CompletedResultExposure | null>(null);
   return createElement(
     I18nextProvider,
     { i18n },
@@ -209,36 +167,30 @@ function Conversation({
       null,
       createElement(SessionSidebar, {
         snapshot: value,
-        selectedPath: value.selectedSession!.path,
+        selectedPath,
         selectedWorkspace: "/project",
         collapsed: new Set<string>(),
         query: "",
         searchOpen: false,
         mobileOpen: false,
         settingsDisabled: false,
-        connected: true,
-        completedResultSeen: seen,
+        connected,
+        sessionViewVisible: enabled,
         onOpenSettings: () => {},
         actions,
       }),
-      showTranscript &&
-        createElement(
-          "main",
-          { hidden },
-          createElement(Transcript, {
-            snapshot: value,
-            liveMessages: [],
-            liveRunning: false,
-            livePhase: "idle",
-            liveRetry: null,
-            thinkingStarts: {},
-            thinkingDurations: {},
-            scrollToBottom: 0,
-            onResend: async () => true,
-            onCompletedResultSeen: setSeen,
-            resultExposureEnabled: enabled,
-          }),
-        ),
+      value.selectedSession &&
+        createElement(Transcript, {
+          snapshot: value,
+          liveMessages: [],
+          liveRunning: false,
+          livePhase: "idle",
+          liveRetry: null,
+          thinkingStarts: {},
+          thinkingDurations: {},
+          scrollToBottom: 0,
+          onResend: async () => true,
+        }),
     ),
   );
 }
@@ -246,13 +198,16 @@ function unread() {
   return document.querySelectorAll(".session-state-completed");
 }
 
-it("acknowledges the exact visible current result immediately, independently of title and mtime", () => {
-  const view = geometry();
+it("requests reading the loaded revision independently of title and mtime, and clears unread only after backend confirmation", () => {
   const value = snapshot();
   const mounted = render(createElement(Conversation, { value }));
+  expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
+    value.sessions[0]!.path,
+    value.sessions[0]!.id,
+    true,
+    value.sessions[0]!.readRevision,
+  );
   expect(unread()).toHaveLength(1);
-  view.flush();
-  expect(unread()).toHaveLength(0);
   const renamed = {
     ...value,
     sessions: value.sessions.map((session) => ({
@@ -262,120 +217,142 @@ it("acknowledges the exact visible current result immediately, independently of 
     })),
   };
   mounted.rerender(createElement(Conversation, { value: renamed }));
-  view.flush();
-  expect(unread()).toHaveLength(0);
-  view.move(600);
+  expect(actions.setSessionRead).toHaveBeenCalledOnce();
+  expect(unread()).toHaveLength(1);
   mounted.rerender(
-    createElement(Conversation, { value: snapshot("A", "turn-2", 3) }),
+    createElement(Conversation, { value: readSnapshot(renamed) }),
   );
-  view.flush();
+  expect(unread()).toHaveLength(0);
+  const next = snapshot("A", "turn-2", 3);
+  mounted.rerender(
+    createElement(Conversation, { value: next, enabled: false }),
+  );
   expect(unread()).toHaveLength(1);
-  view.move(100);
-  view.flush();
+  expect(actions.setSessionRead).toHaveBeenCalledOnce();
+  mounted.rerender(createElement(Conversation, { value: next }));
+  expect(actions.setSessionRead).toHaveBeenCalledTimes(2);
+  expect(actions.setSessionRead).toHaveBeenLastCalledWith(
+    next.sessions[0]!.path,
+    next.sessions[0]!.id,
+    true,
+    next.sessions[0]!.readRevision,
+  );
+  expect(unread()).toHaveLength(1);
+  mounted.rerender(createElement(Conversation, { value: readSnapshot(next) }));
   expect(unread()).toHaveLength(0);
 });
 
-it("does not acknowledge a hidden tab or a result outside the viewport, then acknowledges actual exposure", () => {
-  const view = geometry();
-  view.hide();
+it("keeps a background tab unread and acknowledges its loaded selection when it becomes visible", () => {
+  let visibility = "hidden";
+  vi.spyOn(document, "visibilityState", "get").mockImplementation(
+    () => visibility as DocumentVisibilityState,
+  );
   render(createElement(Conversation, { value: snapshot() }));
-  view.flush();
   expect(unread()).toHaveLength(1);
-  view.move(600);
-  view.show();
-  view.flush();
+  expect(actions.setSessionRead).not.toHaveBeenCalled();
+  visibility = "visible";
+  fireEvent(document, new Event("visibilitychange"));
+  expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
+    "/sessions/A.jsonl",
+    "A",
+    true,
+    snapshot().sessions[0]!.readRevision,
+  );
   expect(unread()).toHaveLength(1);
-  view.move(100);
-  view.flush();
-  expect(unread()).toHaveLength(0);
 });
 
-it("does not acknowledge a covered, collapsed or replaced transcript", () => {
-  const view = geometry();
+it("does not acknowledge hidden, covered or disconnected views", () => {
   const value = snapshot();
   const mounted = render(
     createElement(Conversation, { value, enabled: false }),
   );
-  view.flush();
   expect(unread()).toHaveLength(1);
-  mounted.rerender(createElement(Conversation, { value, hidden: true }));
-  view.flush();
+  expect(actions.setSessionRead).not.toHaveBeenCalled();
+  mounted.rerender(createElement(Conversation, { value, connected: false }));
   expect(unread()).toHaveLength(1);
-  mounted.rerender(
-    createElement(Conversation, { value, showTranscript: false }),
-  );
-  view.flush();
-  expect(unread()).toHaveLength(1);
+  expect(actions.setSessionRead).not.toHaveBeenCalled();
   const dialog = document.createElement("dialog");
   dialog.open = true;
   document.body.append(dialog);
   mounted.rerender(createElement(Conversation, { value }));
-  view.flush();
   expect(unread()).toHaveLength(1);
+  expect(actions.setSessionRead).not.toHaveBeenCalled();
   dialog.open = false;
   fireEvent(dialog, new Event("close"));
-  view.flush();
-  expect(unread()).toHaveLength(0);
+  expect(actions.setSessionRead).toHaveBeenCalledOnce();
+  expect(unread()).toHaveLength(1);
   dialog.remove();
 });
 
 it.each([
-  "empty",
-  "clipped-result",
-  "missing-timing",
-  "wrong-command",
-  "wrong-result",
-  "tool-use",
+  "no-projection",
+  "pending-path",
+  "copied-path",
+  "reused-path",
 ] as const)(
-  "requires exact native timing and rendered result evidence: %s",
-  (missing) => {
-    const view = geometry();
+  "does not acknowledge a requested selection until its exact native path and id load: %s",
+  (pending) => {
     const value = snapshot();
-    const selected = value.selectedSession!;
-    if (missing === "empty") selected.entries = [];
-    if (missing === "clipped-result")
-      selected.entries = selected.entries.filter(
-        (entry) => entry.id !== "result-turn-1",
-      );
-    if (missing === "missing-timing")
-      selected.entries = selected.entries.filter((entry) => !entry.turnTiming);
-    if (missing === "wrong-command")
-      selected.entries[2]!.turnTiming!.commandId = "other-turn";
-    if (missing === "wrong-result")
-      selected.entries[2]!.turnTiming!.resultEntryId = "other-result";
-    if (missing === "tool-use")
-      selected.entries[1]!.message!.stopReason = "toolUse";
-    render(createElement(Conversation, { value }));
-    view.flush();
+    let selectedPath = value.selectedSession!.path;
+    if (pending === "no-projection") delete value.selectedSession;
+    if (pending === "pending-path") selectedPath = "/sessions/not-loaded.jsonl";
+    if (pending === "copied-path")
+      value.selectedSession!.path = "/sessions/copied.jsonl";
+    if (pending === "reused-path") value.selectedSession!.id = "different-id";
+    render(createElement(Conversation, { value, selectedPath }));
     expect(unread()).toHaveLength(1);
-    expect(sessionStorage.getItem("openpi.seen-completions")).toBeNull();
+    expect(actions.setSessionRead).not.toHaveBeenCalled();
   },
 );
 
-it("retains background unread results, cancels a switched-view callback and persists only the viewed exact completion", () => {
-  const view = geometry();
+it("acknowledges a bounded loaded history without requiring its final result to be in the visible page", () => {
+  const value = snapshot();
+  value.selectedSession!.entries = [value.selectedSession!.entries[0]!];
+  value.selectedSession!.truncation = {
+    ...value.selectedSession!.truncation,
+    entriesOmitted: 2,
+    truncated: true,
+  };
+  render(createElement(Conversation, { value }));
+  expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
+    value.sessions[0]!.path,
+    value.sessions[0]!.id,
+    true,
+    value.sessions[0]!.readRevision,
+  );
+  expect(unread()).toHaveLength(1);
+});
+
+it("keeps background completions unread and restores only the backend's exact visited-session projection", () => {
   const a = snapshot();
   const b = snapshot("B");
   b.sessions.unshift(a.sessions[0]!);
-  const mounted = render(createElement(Conversation, { value: a }));
-  mounted.rerender(createElement(Conversation, { value: b }));
-  view.flush();
-  expect(view.cancel).toHaveBeenCalled();
-  expect(unread()).toHaveLength(1);
-  expect(sessionStorage.getItem("openpi.seen-completions")).toContain(
+  const mounted = render(createElement(Conversation, { value: b }));
+  expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
     "/sessions/B.jsonl",
+    "B",
+    true,
+    b.sessions[1]!.readRevision,
   );
-  expect(sessionStorage.getItem("openpi.seen-completions")).not.toContain(
-    "/sessions/A.jsonl",
-  );
+  expect(unread()).toHaveLength(2);
+  mounted.rerender(createElement(Conversation, { value: readSnapshot(b) }));
+  expect(unread()).toHaveLength(1);
   mounted.rerender(createElement(Conversation, { value: a }));
-  view.flush();
+  expect(actions.setSessionRead).toHaveBeenCalledTimes(2);
+  expect(actions.setSessionRead).toHaveBeenLastCalledWith(
+    "/sessions/A.jsonl",
+    "A",
+    true,
+    a.sessions[0]!.readRevision,
+  );
+  expect(unread()).toHaveLength(1);
+  const confirmed = readSnapshot(a);
+  mounted.rerender(createElement(Conversation, { value: confirmed }));
   expect(unread()).toHaveLength(0);
   mounted.unmount();
   const restored = render(
-    createElement(Conversation, { value: a, enabled: false }),
+    createElement(Conversation, { value: confirmed, enabled: false }),
   );
-  view.flush();
   expect(unread()).toHaveLength(0);
   const copied = snapshot();
   copied.selectedSession!.path = "/sessions/copied.jsonl";
@@ -383,24 +360,56 @@ it("retains background unread results, cancels a switched-view callback and pers
   restored.rerender(
     createElement(Conversation, { value: copied, enabled: false }),
   );
-  view.flush();
   expect(unread()).toHaveLength(1);
+  expect(actions.setSessionRead).toHaveBeenCalledTimes(2);
 });
 
-it("can expose a proven legacy timing receipt without an optional stored result id", () => {
-  const view = geometry();
+it("uses the backend revision when a summary has no result entry id", () => {
   const value = snapshot();
-  delete value.selectedSession!.entries[2]!.turnTiming!.resultEntryId;
+  delete value.sessions[0]!.execution!.lastTurn!.resultEntryId;
+  value.selectedSession!.entries = [value.selectedSession!.entries[0]!];
   render(createElement(Conversation, { value }));
-  view.flush();
-  expect(unread()).toHaveLength(0);
+  expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
+    value.sessions[0]!.path,
+    value.sessions[0]!.id,
+    true,
+    value.sessions[0]!.readRevision,
+  );
 });
 
-it("the App does not acknowledge trajectory browsing, then acknowledges returning to the exact chat result", () => {
-  const view = geometry();
+it("does not automatically acknowledge a legacy summary without a read revision", () => {
+  const value = snapshot();
+  delete value.sessions[0]!.readRevision;
+  render(createElement(Conversation, { value }));
+  expect(unread()).toHaveLength(1);
+  expect(actions.setSessionRead).not.toHaveBeenCalled();
+});
+
+it.each(["failed", "cancelled", "uncertain"] as const)(
+  "reads an explicitly unread %s result without changing its runtime outcome",
+  (outcome) => {
+    const value = snapshot();
+    value.sessions[0]!.execution!.lastTurn!.outcome = outcome;
+    const mounted = render(createElement(Conversation, { value }));
+    expect(actions.setSessionRead).toHaveBeenCalledExactlyOnceWith(
+      value.sessions[0]!.path,
+      value.sessions[0]!.id,
+      true,
+      value.sessions[0]!.readRevision,
+    );
+    expect(document.querySelectorAll(".session-row.is-unread")).toHaveLength(1);
+    const confirmed = readSnapshot(value);
+    mounted.rerender(createElement(Conversation, { value: confirmed }));
+    expect(document.querySelectorAll(".session-row.is-unread")).toHaveLength(0);
+    expect(confirmed.sessions[0]!.execution!.lastTurn!.outcome).toBe(outcome);
+  },
+);
+
+it("the App defers acknowledgement during selection and trajectory until the loaded chat is visible", () => {
   const initial = webStore.getState();
   const start = vi.spyOn(initial.actions, "start").mockImplementation(() => {});
   const stop = vi.spyOn(initial.actions, "stop").mockImplementation(() => {});
+  const read = vi.spyOn(initial.actions, "setSessionRead").mockResolvedValue();
   const value = snapshot();
   webStore.setState({
     ...createWebStore().getState(),
@@ -409,16 +418,44 @@ it("the App does not acknowledge trajectory browsing, then acknowledges returnin
     selectedPath: value.selectedSession!.path,
     selectedWorkspace: "/project",
     connection: "connected",
+    sessionSwitching: true,
   });
   const mounted = render(
     createElement(I18nextProvider, { i18n }, createElement(App)),
   );
   try {
-    fireEvent.click(screen.getByRole("button", { name: i18n.t("trajectory") }));
-    view.flush();
     expect(unread()).toHaveLength(1);
+    expect(read).not.toHaveBeenCalled();
+    act(() => webStore.setState({ sessionSwitching: false }));
+    expect(read).toHaveBeenCalledExactlyOnceWith(
+      value.sessions[0]!.path,
+      value.sessions[0]!.id,
+      true,
+      value.sessions[0]!.readRevision,
+    );
+    expect(unread()).toHaveLength(1);
+    act(() => webStore.setState({ snapshot: readSnapshot(value) }));
+    expect(unread()).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: i18n.t("trajectory") }));
+    const next = snapshot("A", "turn-2", 3);
+    act(() => webStore.setState({ snapshot: next }));
+    expect(read).toHaveBeenCalledOnce();
+    expect(unread()).toHaveLength(1);
+    expect(
+      screen
+        .getByRole("button", { name: i18n.t("trajectory") })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: i18n.t("chatView") }));
-    view.flush();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenLastCalledWith(
+      next.sessions[0]!.path,
+      next.sessions[0]!.id,
+      true,
+      next.sessions[0]!.readRevision,
+    );
+    expect(unread()).toHaveLength(1);
+    act(() => webStore.setState({ snapshot: readSnapshot(next) }));
     expect(unread()).toHaveLength(0);
   } finally {
     mounted.unmount();
